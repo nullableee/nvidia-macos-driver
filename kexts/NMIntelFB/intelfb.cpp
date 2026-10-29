@@ -1,3 +1,5 @@
+#include "../NVRM/accel/nv_muxless_topology.h"
+#include "../NVRMAGDC/nvrm-agdc-k5.h"
 // NMIntelFB: framebuffer for the built-in panel of laptops whose panel is wired to an Intel GPU macOS has no driver for
 // (display versions 12-20: Tiger Lake, Rocket Lake, Alder Lake, Raptor Lake, Meteor Lake, Arrow Lake, Lunar Lake).
 //
@@ -17,6 +19,8 @@
 #include <IOKit/ndrvsupport/IOMacOSVideo.h>
 #include <libkern/OSAtomic.h>
 #include "nvrm_vram_abi.h"
+#include "nmintel_scanout.h"
+#include <pexpert/pexpert.h>
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <IOKit/IOTimerEventSource.h>
 #include <IOKit/IOWorkLoop.h>
@@ -31,7 +35,7 @@ extern "C" kern_return_t _start(kmod_info_t *ki, void *d); extern "C" kern_retur
 #ifdef NMINTELFB_VIRTUAL
 extern "C" { KMOD_EXPLICIT_DECL(com.nullmoth.NMIntelFBVirtual, "0.1", _start, _stop) }
 #else
-extern "C" { KMOD_EXPLICIT_DECL(com.nullmoth.NMIntelFB, "0.1", _start, _stop) }
+extern "C" { KMOD_EXPLICIT_DECL(com.nullmoth.NMIntelFB, "0.1.3", _start, _stop) }
 #endif
 extern "C" kern_return_t _start(kmod_info_t *ki, void *d) { return KERN_SUCCESS; }
 extern "C" kern_return_t _stop(kmod_info_t *ki, void *d)  { return KERN_SUCCESS; }
@@ -52,6 +56,8 @@ uint8_t displayVersion(uint16_t dev)
 constexpr uint32_t PLANE_CTL(int p)    { return 0x70180u + (uint32_t)p * 0x1000u; }
 constexpr uint32_t PLANE_STRIDE(int p) { return 0x70188u + (uint32_t)p * 0x1000u; }
 constexpr uint32_t PLANE_SIZE(int p)   { return 0x70190u + (uint32_t)p * 0x1000u; }
+constexpr uint32_t PLANE_OFFSET(int p) { return 0x701A4u + (uint32_t)p * 0x1000u; }
+constexpr uint32_t PLANE_POS(int p)    { return 0x7018Cu + (uint32_t)p * 0x1000u; }
 constexpr uint32_t PLANE_SURF(int p)   { return 0x7019Cu + (uint32_t)p * 0x1000u; }
 constexpr uint32_t TRANSCONF(int p)    { return 0x70008u + (uint32_t)p * 0x1000u; }
 constexpr uint32_t HTOTAL(int t)       { return 0x60000u + (uint32_t)t * 0x1000u; }
@@ -126,7 +132,7 @@ class NMIntelFB : public IOFramebuffer {
         thread_call_enter_delayed(me->fVblTimer, me->fVblNext);
     }
     void armVbl() {
-        fVblTimer = thread_call_allocate(vblFire, this);
+        if (!fVblTimer) fVblTimer = thread_call_allocate(vblFire, this);
         if (fVblTimer) { uint64_t d; clock_interval_to_deadline((uint32_t)(fFrameNs / 1000), kMicrosecondScale, &d); fVblNext = d; thread_call_enter_delayed(fVblTimer, d); }
         IFBLOG("vbl timer %s", fVblTimer ? "armed (60 Hz)" : "ALLOCATE FAILED");
     }
@@ -163,6 +169,9 @@ private:
 
     uint32_t rd(uint32_t off) const { return *(volatile uint32_t *)(fRegs + off); }
     void wr(uint32_t off, uint32_t v) const { *(volatile uint32_t *)(fRegs + off) = v; }
+    NMIntelPlane readPlane(int p) const {
+        return nmIntelReadPlane(fRegs, (unsigned)p);
+    }
     bool adoptFirmwareMode();
     uint32_t fPwmPeriod = 0;                     // firmware's PWM period; 0 = no brightness control
     NMIntelBacklight *fBacklight = nullptr;
@@ -217,7 +226,7 @@ public:
     IOReturn setCLUTWithEntries(IOColorEntry *, UInt32, UInt32, IOOptionBits) override { return kIOReturnSuccess; }
     IOReturn setApertureEnable(IOPixelAperture, IOOptionBits) override { return kIOReturnSuccess; }
     IOReturn setStartupDisplayMode(IODisplayModeID, IOIndex) override { return kIOReturnSuccess; }
-    // Power and connection handling copied from NVRMFB, which shares this controller (same IOFBDependentID). Left to
+    // Power and connection handling copied from NVRMFB. Intel has its own controller. Left to
     // IOFramebuffer's base class, a power change queues on the shared controller thread and waits for an acknowledge
     // (IOFramebuffer::setPowerState returns a 45 s timeout, checkPowerWork -> setAttribute(kIOPowerStateAttribute));
     // NVRMFB acknowledges at once and answers the power attributes itself. With NMIntelFB under NVRM the
@@ -283,6 +292,10 @@ IOService *NMIntelFB::probe(IOService *provider, SInt32 *score)
     IOPCIDevice *pci = OSDynamicCast(IOPCIDevice, provider);
     if (!pci) return nullptr;
     if (PE_parse_boot_argn("-nmintelfboff", nullptr, 0)) { IFBLOG("off by boot-arg"); return nullptr; }
+    uint32_t enabled = 0;
+    if (!PE_parse_boot_argn("nmoptimus", &enabled, sizeof enabled) || enabled != 1) {
+        IFBLOG("nmoptimus=1 absent: preserving the current firmware framebuffer"); return nullptr;
+    }
     uint16_t dev = pci->configRead16(kIOPCIConfigDeviceID);
     fVer = displayVersion(dev);
     if (!fVer) return nullptr;   // an Intel GPU this driver does not know (older ones have Apple's own driver)
@@ -292,22 +305,21 @@ IOService *NMIntelFB::probe(IOService *provider, SInt32 *score)
 
 bool NMIntelFB::adoptFirmwareMode()
 {
-    // the panel is on whichever pipe the firmware used; take the first pipe whose transcoder and plane 1 are both on
-    for (int p = 0; p < 4; p++) {
-        uint32_t conf = rd(TRANSCONF(p)), ctl = rd(PLANE_CTL(p));
-        if (!(conf & kEnable) || !(ctl & kEnable)) continue;
-        if (fmtOf(ctl) != 8) { IFBLOG("pipe %c: plane format %u is not XRGB8888 - leaving the firmware screen", 'A' + p, fmtOf(ctl)); return false; }
-        if (tileOf(ctl) != 0) { IFBLOG("pipe %c: plane is tiled (%u) - leaving the firmware screen", 'A' + p, tileOf(ctl)); return false; }
-        uint32_t size = rd(PLANE_SIZE(p)), stride = rd(PLANE_STRIDE(p)) & 0x7FF;
-        fWidth = (size & 0xFFFF) + 1; fHeight = ((size >> 16) & 0xFFFF) + 1;
-        fRowBytes = stride * 64;                     // linear planes count the stride in 64-byte units
-        fSurf = rd(PLANE_SURF(p)) & ~0xFFFu;         // GGTT offset of the surface, 4 KiB aligned
-        if (fWidth < 320 || fHeight < 200 || fRowBytes < fWidth * 4) {
-            IFBLOG("pipe %c: plane %ux%u stride %u is not a usable surface", 'A' + p, fWidth, fHeight, fRowBytes); return false;
-        }
-        if ((uint64_t)fSurf + (uint64_t)fRowBytes * fHeight > fApertureLen) {
-            IFBLOG("pipe %c: surface at 0x%x is past the %llu MiB aperture", 'A' + p, fSurf, (unsigned long long)(fApertureLen >> 20)); return false;
-        }
+    unsigned active = 0;
+    for (int p = 0; p < 4; ++p) {
+        NMIntelPlane raw = readPlane(p);
+        if ((raw.conf & kEnable) && (raw.ctl & kEnable)) ++active;
+    }
+    if (active != 1) { IFBLOG("need one active firmware plane, found %u", active); return false; }
+    for (int p = 0; p < 4; ++p) {
+        NMIntelPlane raw = readPlane(p);
+        NMIntelLayout layout = {};
+        NMIntelReject why = nmIntelLayout(raw, fApertureLen, layout);
+        IFBLOG("pipe %c conf=%08x ctl=%08x stride=%08x size=%08x surf=%08x offset=%08x pos=%08x reject=%u",
+               'A' + p, raw.conf, raw.ctl, raw.stride, raw.size, raw.surf, raw.offset, raw.position, (unsigned)why);
+        if (why == kNMIntelDisabled) continue;
+        if (why != kNMIntelOK) return false;
+        fWidth = layout.width; fHeight = layout.height; fRowBytes = layout.pitch; fSurf = layout.surface;
         // the transcoder that feeds pipe p is p on these display versions (eDP on transcoder A in every recording)
         fHT = (rd(HTOTAL(p)) >> 16) + 1; fVT = (rd(VTOTAL(p)) >> 16) + 1;
         fHSS = (rd(HSYNC(p)) & 0xFFFF) + 1; fHSE = (rd(HSYNC(p)) >> 16) + 1;
@@ -334,6 +346,13 @@ bool NMIntelFB::adoptFirmwareMode()
     return false;
 }
 
+static bool nmIntelPublishTiming(IOService *service, uint64_t clock, const uint32_t (&timing)[NVK5_TIMING_WORDS])
+{
+    if (clock > 0xffffffffull || nvk5_timing_bad(timing, sizeof timing)) return false;
+    // IORegistryEntry's byte overload copies into OSData but takes void*.
+    return service->setProperty("NVRMTiming", const_cast<uint32_t *>(timing), sizeof timing);
+}
+
 bool NMIntelFB::start(IOService *provider)
 {
 #ifdef NMINTELFB_VIRTUAL
@@ -346,8 +365,8 @@ bool NMIntelFB::start(IOService *provider)
     fApertureBase = fVBuf->getPhysicalSegment(0, nullptr, kIOMemoryMapperNone); fApertureLen = fVBuf->getLength();
     if (!IOFramebuffer::start(provider)) { fVBuf->complete(); OSSafeReleaseNULL(fVBuf); return false; }
     fSurfMap = fVBuf->map();
-    setProperty("IOFBDependentID", 0x4E56524D00000001ull, 64);
-    setProperty("IOFBDependentIndex", 4ull, 32);
+    setProperty("IOFBDependentID", kNMIntelControllerID, 64);
+    setProperty("IOFBDependentIndex", (uint64_t)kNMIntelControllerIndex, 32);
     if (IOWorkLoop *wl = getWorkLoop()) {
         fTimer = IOTimerEventSource::timerEventSource(this, [](OSObject *o, IOTimerEventSource *t) {
             ((NMIntelFB *)o)->sample(); t->setTimeoutMS(2000); });
@@ -365,12 +384,16 @@ bool NMIntelFB::start(IOService *provider)
     fMMIO = fPCI->mapDeviceMemoryWithRegister(kIOPCIConfigBaseAddress0);
     IODeviceMemory *ap = fPCI->getDeviceMemoryWithRegister(kIOPCIConfigBaseAddress2);
     if (!fMMIO || !ap) { IFBLOG("BAR0 or BAR2 is not mapped - leaving the firmware screen"); OSSafeReleaseNULL(fMMIO); return false; }
+    if (fMMIO->getLength() < 0xC825Cu) { IFBLOG("BAR0 too short"); OSSafeReleaseNULL(fMMIO); return false; }
     fRegs = (volatile uint8_t *)fMMIO->getVirtualAddress();
     fApertureBase = ap->getPhysicalAddress(); fApertureLen = ap->getLength();
     if (!adoptFirmwareMode()) { OSSafeReleaseNULL(fMMIO); fRegs = nullptr; return false; }
-    publishBacklight();   // before IOFramebuffer::start: IOFramebuffer::open looks for a service named "backlight"
-    if (!IOFramebuffer::start(provider)) {
-        if (fBacklight) { fBacklight->detach(this); OSSafeReleaseNULL(fBacklight); }
+    const uint32_t timing[NVK5_TIMING_WORDS] = {
+        NVK5_TIMING_TAG, (uint32_t)fPclk, fWidth, fHSS, fHSE, fHT,
+        fHeight, fVSS, fVSE, fVT, (uint32_t)(((uint64_t)fRefresh16 * 1000) >> 16), 0, 0
+    };
+    if (!nmIntelPublishTiming(this, fPclk, timing)) {
+        IFBLOG("firmware timing cannot be represented for AGDC");
         OSSafeReleaseNULL(fMMIO); fRegs = nullptr; return false;
     }
     // Head 4 of the NVIDIA accelerator (NVAccel): WindowServer composites this panel on the NVIDIA card and the
@@ -378,10 +401,22 @@ bool NMIntelFB::start(IOService *provider)
     if (IODeviceMemory *sm = IODeviceMemory::withRange(fApertureBase + fSurf, (IOPhysicalLength)fRowBytes * fHeight)) {
         fSurfMap = sm->map(kIOMapWriteCombineCache); sm->release();
     }
-    if (fSurfMap) {
-        setProperty("IOFBDependentID", 0x4E56524D00000001ull, 64);
-        setProperty("IOFBDependentIndex", 4ull, 32);
-    } else IFBLOG("the surface would not map write-combined: NVIDIA rendering stays off for this panel");
+    if (!fSurfMap) { IFBLOG("scanout map failed"); OSSafeReleaseNULL(fMMIO); fRegs = nullptr; return false; }
+    fVblTimer = thread_call_allocate(vblFire, this);
+    if (!fVblTimer) { OSSafeReleaseNULL(fSurfMap); OSSafeReleaseNULL(fMMIO); fRegs = nullptr; return false; }
+    setProperty("IOFBDependentID", kNMIntelControllerID, 64);
+    setProperty("IOFBDependentIndex", (uint64_t)kNMIntelControllerIndex, 32);
+    publishBacklight();   // open() needs it; all fallible scanout preparation is complete
+    if (!IOFramebuffer::start(provider)) {
+        if (fBacklight) { fBacklight->terminate(kIOServiceSynchronous); fBacklight->detach(this); OSSafeReleaseNULL(fBacklight); }
+        thread_call_free(fVblTimer); fVblTimer = nullptr;
+        OSSafeReleaseNULL(fSurfMap); OSSafeReleaseNULL(fMMIO); fRegs = nullptr; return false;
+    }
+    setProperty("NMMuxlessPatch", "g6mf-v1.4");
+    setProperty("NMIntelFBWidth", fWidth, 32);
+    setProperty("NMIntelFBHeight", fHeight, 32);
+    setProperty("NMIntelFBPitch", fRowBytes, 32);
+    setProperty("NMIntelFBSurface", fSurf, 32);
     setProperty("NMIntelFBPipe", fPipe, 32);
     setProperty("NMIntelFBDisplayVersion", fVer, 32);
     setProperty("built-in", kOSBooleanTrue);   // the panel is the laptop's own (kConnectionFlags says so too)
@@ -551,9 +586,17 @@ IOReturn NMIntelFB::callPlatformFunction(const OSSymbol *fn, bool wait, void *p1
     if (fn && fn->isEqualTo(NVRM_VRAM_FN_SCANOUT)) {
         NVRMVramRequest *r = (NVRMVramRequest *)p1;
         if (!r || r->version != NVRM_VRAM_ABI_VERSION) return kIOReturnBadArgument;
-        if (!fSurfMap) return kIOReturnNotReady;
+        if (!fSurfMap || fStopping) return kIOReturnNotReady;
+#ifndef NMINTELFB_VIRTUAL
+        // A firmware-mode bridge cannot resume a changed or disabled display pipe.
+        // Refuse stale mappings after sleep/modesets rather than write old GGTT pages.
+        NMIntelLayout live = {};
+        if (!fRegs || nmIntelLayout(readPlane(fPipe), fApertureLen, live) != kNMIntelOK ||
+            live.width != fWidth || live.height != fHeight || live.pitch != fRowBytes || live.surface != fSurf)
+            return kIOReturnNotReady;
+#endif
         r->kva = (void *)fSurfMap->getVirtualAddress();
-        r->phys = 0; r->actualSize = 0;
+        r->phys = 0; r->actualSize = (uint64_t)fRowBytes * fHeight;
         r->width = fWidth; r->height = fHeight; r->pitch = fRowBytes;
         return kIOReturnSuccess;
     }

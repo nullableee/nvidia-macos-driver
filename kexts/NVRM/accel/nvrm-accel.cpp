@@ -1,3 +1,4 @@
+#include "nv_muxless_topology.h"
 /*
  * NullMoth NVIDIA driver for macOS
  * Copyright (c) 2026 NullMoth Systems.
@@ -49,9 +50,11 @@ static bool nvaccel_verbose() { static int v = -1; if (v < 0) { int x = 0; v = P
 #define ALOGV(fmt, ...) do { if (nvaccel_verbose()) ALOG(fmt, ##__VA_ARGS__); } while (0)
 #include <libkern/c++/OSSymbol.h>
 #include "nvrm_vram_abi.h"
+#include "nv_muxless_copy.h"
 #include <IOKit/IODeviceMemory.h>
 #include "tahoe_fwd.h"   // macOS 26: inherited slots Apple no longer exports, forwarded through its vtables
 #include "nvaccel_stubs.h"
+#include "nv_muxless_memory.h"
 #include "nvkms-kapi.h"
 #include <sys/sysctl.h>
 #include <libkern/OSAtomic.h>
@@ -97,7 +100,7 @@ SYSCTL_INT(_debug, OID_AUTO, nmxaccel_headless, CTLFLAG_RD | CTLFLAG_LOCKED | CT
 SYSCTL_INT(_debug, OID_AUTO, nvaccel_headless, CTLFLAG_RD | CTLFLAG_LOCKED | CTLFLAG_KERN, &gNvHeadless, 0,
            "1 = no NVIDIA display: Metal device for apps only, WindowServer on the GPU that owns the display");
 #endif
-// 4 NVIDIA heads (nvfbheads=4) + 1 for an Intel built-in panel (NMIntelFB, IOFBDependentIndex 4): WindowServer composites
+// 4 NVIDIA heads (nvfbheads=4) + 1 for an Intel built-in panel (NMIntelFB, render slot 4; its own IOGraphics controller index 0): WindowServer composites
 // that panel on the NVIDIA card and the display-pipe copy path below writes each frame into the Intel scan-out surface.
 static const unsigned kNvMaxFB = 5;
 static unsigned gNvHeadsPublished = 0, gNvHeadsRegistered = 0;
@@ -113,7 +116,7 @@ extern "C" kern_return_t _start(kmod_info_t *ki, void *d); extern "C" kern_retur
 #ifdef NMX_ACCEL
 extern "C" { KMOD_EXPLICIT_DECL(com.nullmoth.NMXAccel, "0.1", _start, _stop) }
 #else
-extern "C" { KMOD_EXPLICIT_DECL(com.nullmoth.NVAccel, "0.1", _start, _stop) }
+extern "C" { KMOD_EXPLICIT_DECL(com.nullmoth.NVAccel, "0.1.2", _start, _stop) }
 #endif
 extern "C" kern_return_t _start(kmod_info_t *ki, void *d) { return KERN_SUCCESS; }
 extern "C" kern_return_t _stop(kmod_info_t *ki, void *d)  { return KERN_SUCCESS; }
@@ -296,18 +299,42 @@ public:
     IONotifier *fFBNote = nullptr;
     IONotifier *fIntelNote = nullptr;
     static NVAccel *gAccel;
+    // NVIDIA display head 0 and the render backend are deliberately separate:
+    // an Intel scanout can never service NVIDIA allocation/RM-handle requests.
+    IOService *fRenderBackend = nullptr;
+    IOService *renderBackend() {
+        if (fFB) return fFB;
+        if (!gNvIgpu) return nullptr;
+        if (fRenderBackend) return fRenderBackend;
+        OSIterator *it = getMatchingServices(serviceMatching("NVRMRenderBridge"));
+        if (!it) return nullptr;
+        while (OSObject *o = it->getNextObject()) {
+            IOService *candidate = OSDynamicCast(IOService, o);
+            IORegistryEntry *e = candidate;
+            for (unsigned up = 0; e && up < 12 && !e->metaCast("IOPCIDevice"); ++up)
+                e = e->getParentEntry(gIOServicePlane);
+            if (!candidate || e != fPCI) continue;
+            candidate->retain();
+            if (!OSCompareAndSwapPtr(nullptr, candidate, (void *volatile *)&fRenderBackend)) candidate->release();
+            break;
+        }
+        it->release();
+        return fRenderBackend;
+    }
     IOService *fFB = nullptr;
     IOService *volatile fFBs[kNvMaxFB] = {};
     unsigned fFBRegistered = 0;
     IOLock *fRegLock = nullptr;
     OSObject *fMetalPlugin = nullptr;
+    static unsigned framebufferSlot(IOService *service) {
+        OSNumber *num = OSDynamicCast(OSNumber, service->getProperty("IOFBDependentIndex"));
+        return nmMuxlessHead(service->metaCast("NMIntelFB") != nullptr, num ? num->unsigned32BitValue() : 0);
+    }
     static bool fbPublished(void *target, void *ref, IOService *newService, IONotifier *note) {
         (void)ref; (void)note;
         NVAccel *me = (NVAccel *)target;
         if (!me || !newService) return true;
-        unsigned idx = 0;
-        OSNumber *num = OSDynamicCast(OSNumber, newService->getProperty("IOFBDependentIndex"));
-        if (num) idx = num->unsigned32BitValue();
+        unsigned idx = framebufferSlot(newService);
         const char *what = "kept";
         if (idx >= kNvMaxFB) what = "OUT OF RANGE -- this head will get no pipe";
         else {
@@ -548,7 +575,10 @@ public:
     }
     bool registerFramebufferLocked(int how) {
         if (!fDM) { ALOG("registerFramebuffer(%d): no display machine", how); return false; }
-        if (!fFB) { ALOG("registerFramebuffer(%d): no framebuffer has published yet", how); return false; }
+        if (!fFB && !(gNvIgpu && fFBs[4])) {
+            ALOG("registerFramebuffer(%d): no NVIDIA or opted-in Intel framebuffer", how); return false;
+        }
+        if (!renderBackend()) { ALOG("registerFramebuffer(%d): render backend not ready", how); return false; }
         unsigned before = fDM->getFramebufferCount();
         ALOG("registerFramebuffer(%d): framebuffer count before = %u", how, before);
         if (how == 2) {
@@ -564,12 +594,13 @@ public:
     }
     const OSSymbol *fSymAlloc = nullptr, *fSymFree = nullptr;
     IOReturn askFramebufferForVram(struct NVRMVramRequest *r, bool alloc) {
-        if (!fFB) return kIOReturnNotAttached;
+        IOService *backend = renderBackend();
+        if (!backend) return kIOReturnNotAttached;
         if (!fSymAlloc) fSymAlloc = OSSymbol::withCStringNoCopy(NVRM_VRAM_FN_ALLOC);
         if (!fSymFree)  fSymFree  = OSSymbol::withCStringNoCopy(NVRM_VRAM_FN_FREE);
         const OSSymbol *fn = alloc ? fSymAlloc : fSymFree;
         if (!fn) return kIOReturnNoMemory;
-        return fFB->callPlatformFunction(fn, false, r, nullptr, nullptr, nullptr);
+        return backend->callPlatformFunction(fn, false, r, nullptr, nullptr, nullptr);
     }
     IOReturn askFramebufferForScanout(struct NVRMVramRequest *r, IOService *fb = nullptr) {
         if (!fb) fb = fFB;
@@ -698,6 +729,12 @@ public:
             ALOG("NMXGPU drives %04x:%04x - starting", pci->configRead16(0x00), pci->configRead16(0x02));
         }
 #else
+        uint32_t optimus = 0;
+        if (PE_parse_boot_argn("nmoptimus", &optimus, sizeof optimus) && optimus == 1) {
+            gNvIgpu = 1;
+            ALOG("G6MF muxless v1: Intel head 4 enabled; NVIDIA render backend remains separate");
+            setProperty("NMMuxlessPatch", "g6mf-v1.3");
+        }
         uint32_t gate = 0;
         if (!PE_parse_boot_argn("nvaccel", &gate, sizeof gate) || !gate) { ALOG("boot-arg nvaccel=1 absent: NOT starting (boot-loop guard)"); return false; }
         if (IOPCIDevice *pci = OSDynamicCast(IOPCIDevice, provider)) {
@@ -965,6 +1002,7 @@ public:
         ALOG("stop");
         stopTemperature();
         stopUtilization();
+        OSSafeReleaseNULL(fRenderBackend);
         IOGraphicsAccelerator2::stop(provider);
     }
     virtual IOReturn callPlatformFunction(const OSSymbol *fn, bool wait, void *p1, void *p2, void *p3, void *p4) APPLE_KEXT_OVERRIDE;
@@ -995,14 +1033,14 @@ IOAccelMemory *NVDisplayPipe::initFramebufferResource(unsigned int index, IOAcce
     r.version = NVRM_VRAM_ABI_VERSION;
     IOReturn ret = a->askFramebufferForScanout(&r, fb);
     if (ret == kIOReturnSuccess && r.kva && !r.phys) {
-        // Another GPU's panel (NMIntelFB on a laptop without a MUX): its scanout is Intel memory with a CPU mapping and
-        // no NVIDIA VRAM address. No vidmem may stand for it (addToAperture/getApertureMemoryDescriptor would hand
-        // BAR1 offset 0 to the GPU), and none may be allocated in its place (fresh VRAM mapped here is the 10-10
-        // os_map_kernel_space hang shape). NULL is the family's own default: frames reach this panel only through
-        // performTransaction's copy into kva (debug.nvaccel_iop_ok_h4 counts them).
-        ALOG("NVDisplayPipe::initFramebufferResource(head %u, index %u): CPU-only scanout %u x %u pitch %u (another GPU's "
-             "panel) -- no framebuffer resource, frames are copied", head, index, r.width, r.height, r.pitch);
-        return nullptr;
+        // Tahoe init_framebuffer_resource leaves pipe.active=0 on a NULL result.
+        // A CPU-only resource owns the real panel mapping, with no GPU address.
+        NMMuxlessScanoutMemory *m = OSTypeAlloc(NMMuxlessScanoutMemory);
+        if (!m) return nullptr;
+        if (!m->initPanel(a, fb, r)) { m->release(); return nullptr; }
+        ALOG("NVDisplayPipe::initFramebufferResource(head %u, index %u): CPU-only Intel resource %p, %u x %u pitch %u; no NVIDIA address",
+             head, index, m, r.width, r.height, r.pitch);
+        return m;
     }
     if (ret != kIOReturnSuccess || !r.phys || !r.actualSize) {
         ALOG("NVDisplayPipe::initFramebufferResource: framebuffer would not describe its scanout (0x%x)", (unsigned)ret);
@@ -1034,8 +1072,35 @@ static NVVidMemory *nvres_vidmem(IOAccelResource2 *r)
     return OSDynamicCast(NVVidMemory, o);
 }
 
+bool NVResource::prepare()
+{
+    OSObject *backing = *(OSObject **)((unsigned char *)this + 0x88);
+    if (NMMuxlessScanoutMemory *cpu = OSDynamicCast(NMMuxlessScanoutMemory, backing)) {
+        // A framebuffer resource is needed to activate the pipe, but this one
+        // must never take IOAccelResource2::map's NVIDIA GPU-address path.
+        if (fCPUScanoutPrepares == 0x7fffffff || !cpu->prepare()) return false;
+        OSIncrementAtomic(&fCPUScanoutPrepares);
+        return true;
+    }
+    return IOAccelResource2::prepare();
+}
+
+bool NVResource::complete()
+{
+    OSObject *backing = *(OSObject **)((unsigned char *)this + 0x88);
+    if (OSDynamicCast(NMMuxlessScanoutMemory, backing)) {
+        if (fCPUScanoutPrepares <= 0) return false;
+        OSDecrementAtomic(&fCPUScanoutPrepares);
+        return true;
+    }
+    return IOAccelResource2::complete();
+}
+
 bool NVResource::addToAperture()
 {
+    OSObject *backing = *(OSObject **)((unsigned char *)this + 0x88);
+    if (NMMuxlessScanoutMemory *cpu = OSDynamicCast(NMMuxlessScanoutMemory, backing))
+        return cpu->ready(); // Already resident on Intel; no NVIDIA aperture insertion.
     NVVidMemory *m = nvres_vidmem(this);
     if (fApLogged < 4) { fApLogged++;
         ALOG("NVResource::addToAperture -> true (vidmem %p phys 0x%llx %llu bytes, already in BAR1)",
@@ -1212,6 +1277,7 @@ public:
 
 static int    gNvIop = 0;
 static SInt64 gCntIopOk, gCntIopFail, gCntIopEmpty, gCntIopSrcRes, gCntIopSrcSurf, gCntIopBlank;
+static SInt64 gCntIopEnter, gCntIopValidate;
 static SInt64 gCntIopOkHead[kNvMaxFB];
 #define NVIOP_LOG_MAX 40
 static unsigned gIopLogs = 0;
@@ -1254,6 +1320,8 @@ const void *NVDisplayPipe::iopMapSurface(unsigned id, IOMemoryDescriptor *md, un
 
 IOReturn NVDisplayPipe::validateTransaction(IOAccelDisplayPipeTransaction2 *)
 {
+    if (OSAddAtomic64(1, &gCntIopValidate) < 3 && NVAccel::gAccel)
+        NVAccel::gAccel->reportPipeGates("validateTransaction");
     return kIOReturnSuccess;
 }
 
@@ -1270,6 +1338,7 @@ static bool nvSurfWaitReady(unsigned int id);
 static void nvAccelIopHome(IOService *fb, unsigned head);
 IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
 {
+    OSAddAtomic64(1, &gCntIopEnter);
     if (!gNvIop) return (IOReturn)0xe00002c7;
     if (!txn) NVIOP_FAIL(kIOReturnBadArgument, "performTransaction(NULL)");
     NVAccel *a = NVAccel::gAccel;
@@ -1296,6 +1365,8 @@ IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
              res ? *(const volatile unsigned int *)(kr + 0xb8) : 0u, res ? *(const volatile unsigned int *)(kr + 0xc0) : 0u,
              vm ? (unsigned long long)vm->fBytes : 0ull, (vm && vm->fKva) ? 1 : 0, vm ? (int)vm->fScanout : -1);
     }
+    const bool muxless = fb->metaCast("NMIntelFB") != nullptr;
+    if (muxless && !s) NVIOP_FAIL(kIOReturnUnsupported, "Intel scanout needs a fenced IOSurface");
     if (!s && vm && vm->fKva) {
         const unsigned char *rr = (const unsigned char *)res;
         w     = *(const volatile unsigned short *)(rr + 0xb0);
@@ -1312,7 +1383,8 @@ IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
         // stale, one-colour buffer on the panel every other frame: full-screen flicker, 5 of 40 flicker recordings
         // (1.13-1.14.1), nvaccel_iop_blank about half of every copied frame, never on machines whose frames all flip.
         // Such a frame now keeps the previous picture on the panel instead.
-        nvSurfWaitReady(s->getSurfaceID());   // a copied frame is read here, so its GPU work must be done first
+        const bool gpuReady = nvSurfWaitReady(s->getSurfaceID());
+        if (muxless && !gpuReady) return kIOReturnSuccess; // retain the last completed frame
         if (!nvAccelSurfCopyReady(s, head)) return kIOReturnSuccess;
         const unsigned fmt = s->getPixelFormat();
         if (fmt != 0x42475241u) NVIOP_FAIL(kIOReturnUnsupported, "surface 0x%x format 0x%08x is not BGRA", s->getSurfaceID(), fmt);
@@ -1337,7 +1409,12 @@ IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
     if (w != q.width || h != q.height) NVIOP_FAIL(kIOReturnBadArgument, "source %ux%u is not the scanout's %ux%u", w, h, q.width, q.height);
 
     nvAccelIopHome(fb, head);
-    const unsigned words = (((pitch < q.pitch) ? pitch : q.pitch) & ~3u) / 4;
+    if (muxless) {
+        if (!nvMuxlessCopy((volatile uint32_t *)q.kva, q.actualSize, q.pitch, src,
+                           (uint64_t)pitch * h, pitch, w, h))
+            NVIOP_FAIL(kIOReturnOverrun, "Intel scanout copy geometry/capacity refused");
+    }
+    const unsigned words = muxless ? 0 : (((pitch < q.pitch) ? pitch : q.pitch) & ~3u) / 4;
     const unsigned spr = pitch / 4, dpr = q.pitch / 4;
     volatile unsigned int *d = (volatile unsigned int *)q.kva;
     for (unsigned y = 0; y < h; y++) {
@@ -1418,6 +1495,8 @@ NVACCEL_CNT(nvaccel_map_commit,       gCntMapCommit,      "GPU page-table commit
 NVACCEL_CNT(nvaccel_map_release,      gCntMapRelease,     "GPU page-table releases (UNMAP_ONLY)");
 NVACCEL_CNT(nvaccel_map_free,         gCntMapFree,        "GPU VA ranges freed (nvAccelGpuVaFree)");
 NVACCEL_CNT(nvaccel_iop_ok,           gCntIopOk,          "K3: display-pipe transactions copied to the panel");
+NVACCEL_CNT(nvaccel_iop_enter,        gCntIopEnter,       "calls into performTransaction");
+NVACCEL_CNT(nvaccel_iop_validate,     gCntIopValidate,    "calls into validateTransaction");
 NVACCEL_CNT(nvaccel_iop_ok_h0,        gCntIopOkHead[0],   "frames copied to head 0's panel");
 NVACCEL_CNT(nvaccel_iop_ok_h1,        gCntIopOkHead[1],   "frames copied to head 1's panel");
 NVACCEL_CNT(nvaccel_iop_ok_h2,        gCntIopOkHead[2],   "frames copied to head 2's panel");
@@ -1522,7 +1601,12 @@ static bool nvSurfWaitReady(unsigned int id)
         unsigned i = 0;
         while (i < 32 && gSurfPend[i].id != id) i++;
         if (i == 32) break;
-        if (mach_absolute_time() >= deadline) { gSurfPend[i].id = 0; ready = false; break; }
+        if (mach_absolute_time() >= deadline) {
+            // Keep the fence pending for muxless copies; deleting it would let the
+            // next present read the same unfinished surface as if it were ready.
+            if (!gNvIgpu) gSurfPend[i].id = 0;
+            ready = false; break;
+        }
         waited = true;
         IOLockSleepDeadline(l, gSurfPend, deadline, THREAD_UNINT);
     }
@@ -1574,6 +1658,7 @@ static void nvaccelInstallSysctl(void)
     sysctl_register_oid(&sysctl__debug_nvaccel_map_free);
     sysctl_register_oid(&sysctl__debug_nvaccel_iop);
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_ok);         sysctl_register_oid(&sysctl__debug_nvaccel_iop_fail);
+    sysctl_register_oid(&sysctl__debug_nvaccel_iop_enter);      sysctl_register_oid(&sysctl__debug_nvaccel_iop_validate);
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_empty);
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_src_res);    sysctl_register_oid(&sysctl__debug_nvaccel_iop_src_surf);
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_blank);      sysctl_register_oid(&sysctl__debug_nvaccel_iop_copy_skip);
@@ -1618,7 +1703,8 @@ static bool nvAccelRmHandles(struct NVRMRmHandles *out)
             ALOG("nvAccelRmHandles: no NVAccel instance yet -- too early"); }
         return false;
     }
-    if (!a->fFB) {
+    IOService *backend = a->renderBackend();
+    if (!backend) {
         if (nvRmHandlesLogged < 8) { nvRmHandlesLogged++;
             ALOG("nvAccelRmHandles: no framebuffer has published yet -- will retry"); }
         return false;
@@ -1632,7 +1718,7 @@ static bool nvAccelRmHandles(struct NVRMRmHandles *out)
     struct NVRMRmHandles h;
     nvAccelZero(&h, sizeof h);
     h.version = NVRM_GPUVA_ABI_VERSION;
-    IOReturn r = a->fFB->callPlatformFunction(sym, false, &h, nullptr, nullptr, nullptr);
+    IOReturn r = backend->callPlatformFunction(sym, false, &h, nullptr, nullptr, nullptr);
     sym->release();
     if (r != kIOReturnSuccess || !h.kapiDevice) {
         if (nvRmHandlesLogged < 8) { nvRmHandlesLogged++;
@@ -2313,6 +2399,8 @@ static bool nvAccelSurfCopyReady(IOSurface *s, unsigned head)
     }
     if (head >= kNvMaxFB) return true;
     if (ready) { gIopCopyHeld[head] = 0; return true; }
+    // A muxless panel must never copy stale GPU memory after an arbitrary retry count.
+    if (gNvIgpu && head == 4) { OSAddAtomic64(1, &gCntIopCopySkip); return false; }
     if (++gIopCopyHeld[head] > 4) { gIopCopyHeld[head] = 0; return true; }
     OSAddAtomic64(1, &gCntIopCopySkip);
     return false;

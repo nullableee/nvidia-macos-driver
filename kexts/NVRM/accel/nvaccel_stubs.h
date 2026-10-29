@@ -46,6 +46,9 @@ public:
         return size;
     }
     bool addToAperture() APPLE_KEXT_OVERRIDE;
+    bool prepare() APPLE_KEXT_OVERRIDE;
+    bool complete() APPLE_KEXT_OVERRIDE;
+    SInt32 fCPUScanoutPrepares = 0;
     void removeFromAperture() APPLE_KEXT_OVERRIDE;
     void *getApertureMemoryDescriptor(unsigned long long *a0) APPLE_KEXT_OVERRIDE;
     void free() APPLE_KEXT_OVERRIDE;

@@ -1,0 +1,206 @@
+name: G6 MF kexts
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: Complete offline stack, patched kexts, or standalone probe
+        type: choice
+        options:
+          - bridge
+          - full
+          - all
+          - probe
+        default: full
+  push:
+    paths:
+      - '.github/workflows/g6mf-kexts.yml'
+      - 'kexts/**'
+      - 'tools/**'
+      - 'docs/G6MF-MUXLESS-V1.md'
+  pull_request:
+    paths:
+      - '.github/workflows/g6mf-kexts.yml'
+      - 'kexts/**'
+      - 'tools/**'
+      - 'docs/G6MF-MUXLESS-V1.md'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: g6mf-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  G6MF_TARGET: ${{ inputs.target || 'all' }}
+
+jobs:
+  tests:
+    name: CPU regressions
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Test production code and EFI tools
+        shell: bash
+        run: |
+          mkdir -p test-logs
+          for test in \
+            test_g6mf_cpu_scanout \
+            test_g6mf_muxless \
+            test_g6mf_probe_efi \
+            test_g6mf_macho \
+            test_g6mf_full \
+            test_g6mf_metal_probe \
+            test_g6mf_boot_capture \
+            test_g6mf_agdc \
+            test_g6mf_fb_start \
+            test_g6mf_bridge_stage \
+            test_headless_early \
+            test_iop_flip_gate \
+            test_surface_pending_lifetime \
+            test_vram_display_budget; do
+            python3 "tools/$test.py" 2>&1 | tee "test-logs/$test.log"
+          done
+      - name: Retain test logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: g6mf-tests-${{ github.sha }}
+          path: test-logs/
+          if-no-files-found: error
+          retention-days: 14
+
+  build:
+    name: Tahoe x86_64 kexts
+    needs: tests
+    runs-on: macos-26-intel
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Fetch pinned MacKernelSDK
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: acidanthera/MacKernelSDK
+          ref: 3f750085caa17ec3a7880f11c11bf4f48cd6a164
+          path: .deps/MacKernelSDK
+          persist-credentials: false
+      - name: Fetch pinned NVIDIA 615.78.08 sources
+        if: env.G6MF_TARGET != 'probe'
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: NVIDIA/open-gpu-kernel-modules
+          ref: 1a82fbfda8f321b056eb3568850f9316c5e465c5
+          path: .deps/ogkm
+          persist-credentials: false
+      - name: Record native toolchain
+        shell: bash
+        run: |
+          mkdir -p build/g6mf
+          {
+            sw_vers
+            uname -m
+            xcrun clang++ --version
+            xcrun --show-sdk-path
+            python3 --version
+          } | tee build/g6mf/toolchain.log
+          test "$(uname -m)" = x86_64
+      - name: Compile and link kexts
+        shell: bash
+        run: |
+          case "$G6MF_TARGET" in
+            probe)
+              python3 tools/build_g6mf.py \
+                --sdk .deps/MacKernelSDK --out build/g6mf --probe-only
+              ;;
+            all|full|bridge)
+              python3 tools/build_g6mf.py \
+                --sdk .deps/MacKernelSDK --ogkm .deps/ogkm --out build/g6mf
+              ;;
+            *) echo "Unsupported build target: $G6MF_TARGET" >&2; exit 1 ;;
+          esac
+      - name: Check bundle metadata and package offline kit
+        shell: bash
+        run: |
+          python3 tools/validate_g6mf_kext.py build/g6mf/*.kext \
+            | tee build/g6mf/kext-metadata.log
+          if [ "$G6MF_TARGET" = probe ]; then package_target=probe; else package_target=all; fi
+          python3 tools/package_g6mf.py \
+            --build build/g6mf --out dist --target "$package_target"
+      - name: Build shader-gated bridge update
+        if: env.G6MF_TARGET == 'full' || env.G6MF_TARGET == 'bridge'
+        shell: bash
+        run: |
+          xcrun clang -arch x86_64 -mmacosx-version-min=15.0 \
+            -DG6MF_SHADER_PROBE -O2 -fno-builtin -Wall -Wextra -Werror \
+            tools/g6mf_metal_probe.c -o build/g6mf-shader-probe
+          xcrun clang -arch x86_64 -mmacosx-version-min=15.0 -O2 -fno-builtin \
+            -Wall -Wextra -Werror tools/g6mf_iop_map_probe.c -o build/g6mf-map-probe
+          python3 tools/package_g6mf_bridge.py \
+            --build build/g6mf --shader-probe build/g6mf-shader-probe --map-probe build/g6mf-map-probe --out bridge-dist
+      - name: Upload bridge update
+        if: env.G6MF_TARGET == 'full' || env.G6MF_TARGET == 'bridge'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: g6mf-bridge-v4-x86_64-${{ github.sha }}
+          path: |
+            bridge-dist/NullMoth-G6MF-Bridge-v5.tar.gz
+            bridge-dist/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 30
+      - name: Compose complete pinned driver stack
+        if: env.G6MF_TARGET == 'full'
+        shell: bash
+        run: |
+          curl --fail --location --retry 3 \
+            --output build/nullmoth-nvidia-2.6.4.tar.gz \
+            https://github.com/nullmoth/nvidia-macos-driver/releases/download/v2.6.4/nullmoth-nvidia-2.6.4.tar.gz
+          xcrun clang -arch x86_64 -mmacosx-version-min=15.0 \
+            -O2 -fno-builtin -Wall -Wextra -Werror \
+            tools/g6mf_metal_probe.c -o build/g6mf-metal-probe
+          python3 tools/package_g6mf_full.py \
+            --upstream-archive build/nullmoth-nvidia-2.6.4.tar.gz \
+            --build build/g6mf --metal-probe build/g6mf-metal-probe --out full-dist
+      - name: Upload complete offline stack
+        if: env.G6MF_TARGET == 'full'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: g6mf-full-stack-x86_64-${{ github.sha }}
+          path: |
+            full-dist/NullMoth-G6MF-Full-v1.tar.gz
+            full-dist/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 30
+      - name: Upload offline kit
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: g6mf-${{ env.G6MF_TARGET }}-x86_64-${{ github.sha }}
+          path: |
+            dist/NullMoth-G6MF-v1.tar.gz
+            dist/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 30
+      - name: Retain compiler and linker diagnostics
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: g6mf-build-logs-${{ github.sha }}
+          path: |
+            build/g6mf/*.log
+            build/g6mf/build-manifest.json
+          if-no-files-found: warn
+          retention-days: 14
+      - name: Build summary
+        shell: bash
+        run: |
+          {
+            echo '### G6 MF build completed'
+            echo "Target: $G6MF_TARGET; source commit: $GITHUB_SHA."
+            echo 'Download the offline kit artifact and verify SHA256SUMS.'
+            echo 'The kexts are unsigned. CI does not test an RTX GPU, Intel scanout, Metal or WindowServer.'
+          } >> "$GITHUB_STEP_SUMMARY"

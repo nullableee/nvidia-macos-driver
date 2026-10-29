@@ -876,6 +876,46 @@ void NVRMNVDAFramebuffer::surveyBar1()
     if (!shown) FBLOG("  BAR survey: NO structured region found in %llu MB", fBarLen >> 20);
     else        FBLOG("  BAR survey: %u structured region(s) listed above", shown);
 }
+// A display-less card still needs allocation and RM-handle services. Publishing
+// a separate IOService avoids inventing a lit NVIDIA framebuffer or treating
+// Intel aperture pages as NVIDIA VRAM. The failed display candidate stays alive
+// only as the broker's implementation; it is never registered as a framebuffer.
+class NVRMRenderBridge : public IOService {
+    OSDeclareDefaultStructors(NVRMRenderBridge)
+    IOService *fTarget = nullptr;
+public:
+    bool initWithTarget(IOService *target) {
+        if (!target || !IOService::init()) return false;
+        fTarget = target; fTarget->retain(); return true;
+    }
+    void free() override { OSSafeReleaseNULL(fTarget); IOService::free(); }
+    IOReturn callPlatformFunction(const OSSymbol *fn, bool wait, void *p1,
+                                  void *p2, void *p3, void *p4) override {
+        if (fTarget && fn && (fn->isEqualTo(NVRM_VRAM_FN_ALLOC) ||
+            fn->isEqualTo(NVRM_VRAM_FN_FREE) || fn->isEqualTo(NVRM_GPUVA_FN_HANDLES)))
+            return fTarget->callPlatformFunction(fn, wait, p1, p2, p3, p4);
+        return IOService::callPlatformFunction(fn, wait, p1, p2, p3, p4);
+    }
+};
+OSDefineMetaClassAndStructors(NVRMRenderBridge, IOService)
+static NVRMRenderBridge *gRenderBridge;
+static void nvrmPublishRenderBridge(IOService *target, IOService *provider)
+{
+    NVRMDisplayGate gate;
+    if (!gate.valid() || gRenderBridge) return;
+    uint32_t enabled = 0;
+    if (!PE_parse_boot_argn("nmoptimus", &enabled, sizeof enabled) || enabled != 1) return;
+    NVRMRenderBridge *b = OSTypeAlloc(NVRMRenderBridge);
+    if (!b) return;
+    if (!b->initWithTarget(target)) { b->release(); return; }
+    if (!b->attach(provider)) { b->release(); return; }
+    if (!b->start(provider)) { b->detach(provider); b->release(); return; }
+    b->setProperty("NMMuxlessPatch", "g6mf-v1");
+    gRenderBridge = b;
+    b->registerService();
+    IOLog("NVRMFB: muxless NVRMRenderBridge published without a NVIDIA display head\n");
+}
+
 bool NVRMNVDAFramebuffer::kapiInit()
 {
     struct NvKmsKapiAllocateDeviceParams ap = {}; ap.gpuId = fGpuId; ap.privateData = this; ap.eventCallback = eventCallback;
@@ -2735,6 +2775,10 @@ bool NVRMNVDAFramebuffer::start(IOService *provider)
     if (!kapiOk && fOwnsHead) { gHeadsTaken &= ~(1u << fHead); fOwnsHead = false; }
     IORecursiveLockUnlock(sl);
     if (!kapiOk) {
+        // Only a successfully enumerated, display-less device may be a render backend.
+        if (fIndex == 0 && fDev && gNDpy == 0 && getProvider() &&
+            getProvider()->getProperty("connected-displays"))
+            nvrmPublishRenderBridge(this, provider);
         // nvfbheads=4 starts four framebuffer instances; the ones past the connected displays have nothing to drive and
         // stop here on every healthy boot. Say so, so a log with one lit head is not read as a refused framebuffer.
         if (fSpareIndex)
