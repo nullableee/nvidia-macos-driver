@@ -49,6 +49,10 @@ jobs:
         run: |
           mkdir -p test-logs
           for test in \
+            test_g6mf_lut_wrapper \
+            test_g6mf_lut_install \
+            test_g6mf_perf_collector \
+            test_g6mf_perf \
             test_g6mf_cpu_scanout \
             test_g6mf_muxless \
             test_g6mf_probe_efi \
@@ -149,7 +153,7 @@ jobs:
         with:
           name: g6mf-bridge-v4-x86_64-${{ github.sha }}
           path: |
-            bridge-dist/NullMoth-G6MF-Bridge-v5.tar.gz
+            bridge-dist/NullMoth-G6MF-Bridge-*.tar.gz
             bridge-dist/SHA256SUMS
           if-no-files-found: error
           retention-days: 30
@@ -204,3 +208,22 @@ jobs:
             echo 'Download the offline kit artifact and verify SHA256SUMS.'
             echo 'The kexts are unsigned. CI does not test an RTX GPU, Intel scanout, Metal or WindowServer.'
           } >> "$GITHUB_STEP_SUMMARY"
+
+  lut:
+    name: Build optional LUT experiment
+    runs-on: macos-26-intel
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+      - name: Build C-only loader and Metal probe
+        run: python3 tools/build_g6mf_lut.py --out lut-build
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: g6mf-lut-experiment-${{ github.sha }}
+          path: |
+            lut-build/NVMTLDriver
+            lut-build/lut-probe
+            lut-build/build-manifest.json
+          if-no-files-found: error

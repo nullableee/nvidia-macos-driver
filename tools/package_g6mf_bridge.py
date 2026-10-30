@@ -7,11 +7,13 @@ p=argparse.ArgumentParser();p.add_argument('--build',type=Path,required=True);p.
 sha=lambda f:hashlib.sha256(f.read_bytes()).hexdigest()
 m=json.loads((a.build/'build-manifest.json').read_text());bundle=a.build/'NMIntelFB.kext';binary=bundle/'Contents/MacOS/NMIntelFB'
 assert sha(binary)==m['binaries']['NMIntelFB']['sha256']
-assert plistlib.loads((bundle/'Contents/Info.plist').read_bytes())['CFBundleVersion']=='0.1.3'
+version=plistlib.loads((bundle/'Contents/Info.plist').read_bytes())['CFBundleVersion']
+assert version in ('0.1.3','0.1.4')
+perf=version=='0.1.4'
 assert struct.unpack_from('<4I',a.shader_probe.read_bytes())[:2]==(0xfeedfacf,0x01000007)
 assert struct.unpack_from('<4I',a.shader_probe.read_bytes())[3]==2
 subprocess.run([sys.executable,str(R/'tools/validate_g6mf_kext.py'),str(bundle)],check=True)
-kit=a.out.resolve()/'NullMoth-G6MF-Bridge-v5'
+kit=a.out.resolve()/('NullMoth-G6MF-Bridge-v6-Perf' if perf else 'NullMoth-G6MF-Bridge-v5')
 if kit.exists():p.error('Kit directory exists; choose fresh output')
 kit.mkdir(parents=True);(kit/'validation').mkdir()
 shutil.copytree(bundle,kit/bundle.name)
@@ -31,6 +33,15 @@ assert struct.unpack_from('<4I',a.map_probe.read_bytes())[:2]==(0xfeedfacf,0x010
 assert struct.unpack_from('<4I',a.map_probe.read_bytes())[3]==2
 shutil.copy2(a.map_probe,kit/'map-probe');(kit/'map-probe').chmod(0o755)
 identity={'name':'G6MF bridge v5','base':m['base'],'old_kext_sha':'1f0b7618698919c0e874f926f77e83aff3831e6c6d02350b4e5a982e9a4e011d','new_kext_sha':sha(binary),'old_accel_sha':'ab6dd6315ad5e24ceffb9d0fef4a54d91bcbc2bfcfd67aca0806eec3455eebcb','new_accel_sha':sha(accel/'Contents/MacOS/NVAccel'),'old_agdc_sha':'ffedc0ce0596aaab8076c3034b86f82024078ef67e1e02383eb951fceebf519d','new_agdc_sha':sha(agdc/'Contents/MacOS/NVRMAGDC'),'shader_probe_sha':sha(a.shader_probe),'fix':'CPU-only Intel scanout memory activates the family pipe without NVIDIA GPU mapping','shader_hardware_validated':False,'scanout_hardware_validated':False}
+if perf:
+ identity.update(name='G6MF performance diagnostics v6',old_accel_sha='7e397e85b614382a83861f780a394fb2eb49210b2085acd48d1bb9a821ee8cf4',fix='read-only timing counters on the working v5 display path')
+ shutil.copy2(R/'tools/g6mf_install_perf.sh',kit/'install-perf.sh')
+ shutil.copy2(R/'tools/g6mf_collect_perf.sh',kit/'collect-perf.sh')
+ shutil.copy2(R/'tools/g6mf_profile_perf.sh',kit/'profile-perf.sh')
+ shutil.copy2(R/'docs/G6MF-PERF-V6-RU.md',kit/'README-RU.md')
+ for unused in ('next-stage.sh','prepare-bridge.py'):(kit/unused).unlink()
+ variables={'OLD_KEXT_SHA':identity['old_kext_sha'],'NEW_KEXT_SHA':identity['new_kext_sha'],'OLD_ACCEL_SHA':identity['old_accel_sha'],'NEW_ACCEL_SHA':identity['new_accel_sha'],'OLD_AGDC_SHA':identity['old_agdc_sha'],'NEW_AGDC_SHA':identity['new_agdc_sha']}
+ (kit/'plan.env').write_text(''.join(k+'='+v+'\n' for k,v in variables.items()))
 (kit/'validation/update-identity.json').write_text(json.dumps(identity,indent=2)+'\n')
 shutil.copy2(a.build/'build-manifest.json',kit/'validation/build-manifest.json')
 for name in ('NMIntelFB','NVAccel','NVRMAGDC'):

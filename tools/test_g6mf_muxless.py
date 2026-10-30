@@ -128,10 +128,13 @@ with tempfile.TemporaryDirectory(prefix='g6mf-tests-') as d:
  subprocess.run(['clang++','-std=c++17','-fsanitize=address,undefined','-fno-omit-frame-pointer','-g','-I'+str(R/'kexts/NMIntelFB'),'-I'+str(R/'kexts/NVRM/accel'),str(p/'test.cpp'),'-o',str(p/'test')],check=True)
  subprocess.run([str(p/'test')],check=True)
  # Prove the Intel-only fixture detects the upstream head-0 dependency.
- old=subprocess.check_output(['git','show','HEAD:kexts/NVRM/accel/nvrm-accel.cpp'],cwd=R,text=True)
- oldfixture=fixture.replace(body(src,'    bool registerFramebufferLocked('),body(old,'    bool registerFramebufferLocked('))
+ original=body(src,'    bool registerFramebufferLocked(')
+ gate='if (!fFB && !(gNvIgpu && fFBs[4]))'
+ assert original.count(gate)==1
+ control=original.replace(gate,'if (!fFB)')
+ oldfixture=fixture.replace(original,control)
  (p/'old.cpp').write_text(oldfixture)
  subprocess.run(['clang++','-std=c++17','-I'+str(R/'kexts/NMIntelFB'),'-I'+str(R/'kexts/NVRM/accel'),str(p/'old.cpp'),'-o',str(p/'old')],check=True)
  result=subprocess.run([str(p/'old')],stdout=subprocess.PIPE,stderr=subprocess.PIPE)
  assert result.returncode!=0,'regression must fail on upstream method'
- print('PASS: unpatched upstream fails the Intel-only registration regression')
+ print('PASS: head-0-only negative control fails the Intel-only registration regression')

@@ -55,6 +55,7 @@ static bool nvaccel_verbose() { static int v = -1; if (v < 0) { int x = 0; v = P
 #include "tahoe_fwd.h"   // macOS 26: inherited slots Apple no longer exports, forwarded through its vtables
 #include "nvaccel_stubs.h"
 #include "nv_muxless_memory.h"
+#include "nv_perf.h"
 #include "nvkms-kapi.h"
 #include <sys/sysctl.h>
 #include <libkern/OSAtomic.h>
@@ -116,7 +117,7 @@ extern "C" kern_return_t _start(kmod_info_t *ki, void *d); extern "C" kern_retur
 #ifdef NMX_ACCEL
 extern "C" { KMOD_EXPLICIT_DECL(com.nullmoth.NMXAccel, "0.1", _start, _stop) }
 #else
-extern "C" { KMOD_EXPLICIT_DECL(com.nullmoth.NVAccel, "0.1.2", _start, _stop) }
+extern "C" { KMOD_EXPLICIT_DECL(com.nullmoth.NVAccel, "0.1.3", _start, _stop) }
 #endif
 extern "C" kern_return_t _start(kmod_info_t *ki, void *d) { return KERN_SUCCESS; }
 extern "C" kern_return_t _stop(kmod_info_t *ki, void *d)  { return KERN_SUCCESS; }
@@ -1278,6 +1279,9 @@ public:
 static int    gNvIop = 0;
 static SInt64 gCntIopOk, gCntIopFail, gCntIopEmpty, gCntIopSrcRes, gCntIopSrcSurf, gCntIopBlank;
 static SInt64 gCntIopEnter, gCntIopValidate;
+static NMPerfMetric gPerfEntry, gPerfFence, gPerfReady, gPerfCopy, gPerfTotal;
+static uint64_t gPerfLastEntry;
+static SInt64 gPerfBins[6];
 static SInt64 gCntIopOkHead[kNvMaxFB];
 #define NVIOP_LOG_MAX 40
 static unsigned gIopLogs = 0;
@@ -1345,6 +1349,17 @@ IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
     unsigned head = 0;
     IOService *fb = a ? a->pipeFramebuffer(this, &head) : nullptr;
     if (!fb) NVIOP_FAIL(kIOReturnNotAttached, "no accelerator, or pipe %p drives a framebuffer that is none of ours", this);
+    const bool perfIntel = head == 4 && fb->metaCast("NMIntelFB");
+    NMPerfScope transactionTime(perfIntel ? &gPerfTotal : nullptr);
+    if (perfIntel) {
+        uint64_t now = mach_absolute_time();
+        uint64_t previous = __atomic_exchange_n(&gPerfLastEntry, now, __ATOMIC_RELAXED);
+        if (previous && now >= previous) {
+            uint64_t ns = 0; absolutetime_to_nanoseconds(now - previous, &ns);
+            nmPerfAdd(gPerfEntry, ns);
+            OSAddAtomic64(1, &gPerfBins[nmPerfGapBin(ns)]);
+        }
+    }
 
     IOSurface *s  = txn->getPlaneIOSurface(0, 0);
     OSObject  *ro = txn->getPlaneResource(0, 0);
@@ -1383,9 +1398,14 @@ IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
         // stale, one-colour buffer on the panel every other frame: full-screen flicker, 5 of 40 flicker recordings
         // (1.13-1.14.1), nvaccel_iop_blank about half of every copied frame, never on machines whose frames all flip.
         // Such a frame now keeps the previous picture on the panel instead.
+        uint64_t fenceStart = perfIntel ? mach_absolute_time() : 0;
         const bool gpuReady = nvSurfWaitReady(s->getSurfaceID());
+        if (perfIntel) nmPerfAdd(gPerfFence, nmPerfElapsed(fenceStart));
         if (muxless && !gpuReady) return kIOReturnSuccess; // retain the last completed frame
-        if (!nvAccelSurfCopyReady(s, head)) return kIOReturnSuccess;
+        uint64_t readyStart = perfIntel ? mach_absolute_time() : 0;
+        const bool copyReady = nvAccelSurfCopyReady(s, head);
+        if (perfIntel) nmPerfAdd(gPerfReady, nmPerfElapsed(readyStart));
+        if (!copyReady) return kIOReturnSuccess;
         const unsigned fmt = s->getPixelFormat();
         if (fmt != 0x42475241u) NVIOP_FAIL(kIOReturnUnsupported, "surface 0x%x format 0x%08x is not BGRA", s->getSurfaceID(), fmt);
         const unsigned long long W = s->getWidth(), H = s->getHeight(), P = s->getBytesPerRow();
@@ -1410,6 +1430,7 @@ IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
 
     nvAccelIopHome(fb, head);
     if (muxless) {
+        NMPerfScope copyTime(perfIntel ? &gPerfCopy : nullptr);
         if (!nvMuxlessCopy((volatile uint32_t *)q.kva, q.actualSize, q.pitch, src,
                            (uint64_t)pitch * h, pitch, w, h))
             NVIOP_FAIL(kIOReturnOverrun, "Intel scanout copy geometry/capacity refused");
@@ -1495,6 +1516,27 @@ NVACCEL_CNT(nvaccel_map_commit,       gCntMapCommit,      "GPU page-table commit
 NVACCEL_CNT(nvaccel_map_release,      gCntMapRelease,     "GPU page-table releases (UNMAP_ONLY)");
 NVACCEL_CNT(nvaccel_map_free,         gCntMapFree,        "GPU VA ranges freed (nvAccelGpuVaFree)");
 NVACCEL_CNT(nvaccel_iop_ok,           gCntIopOk,          "K3: display-pipe transactions copied to the panel");
+NVACCEL_CNT(nvaccel_perf_entry_count, gPerfEntry.count, "Intel entry timing count; ns units");
+NVACCEL_CNT(nvaccel_perf_entry_ns, gPerfEntry.ns, "Intel entry timing ns; ns units");
+NVACCEL_CNT(nvaccel_perf_entry_max, gPerfEntry.max, "Intel entry timing max; ns units");
+NVACCEL_CNT(nvaccel_perf_fence_count, gPerfFence.count, "Intel fence timing count; ns units");
+NVACCEL_CNT(nvaccel_perf_fence_ns, gPerfFence.ns, "Intel fence timing ns; ns units");
+NVACCEL_CNT(nvaccel_perf_fence_max, gPerfFence.max, "Intel fence timing max; ns units");
+NVACCEL_CNT(nvaccel_perf_ready_count, gPerfReady.count, "Intel ready timing count; ns units");
+NVACCEL_CNT(nvaccel_perf_ready_ns, gPerfReady.ns, "Intel ready timing ns; ns units");
+NVACCEL_CNT(nvaccel_perf_ready_max, gPerfReady.max, "Intel ready timing max; ns units");
+NVACCEL_CNT(nvaccel_perf_copy_count, gPerfCopy.count, "Intel copy timing count; ns units");
+NVACCEL_CNT(nvaccel_perf_copy_ns, gPerfCopy.ns, "Intel copy timing ns; ns units");
+NVACCEL_CNT(nvaccel_perf_copy_max, gPerfCopy.max, "Intel copy timing max; ns units");
+NVACCEL_CNT(nvaccel_perf_total_count, gPerfTotal.count, "Intel total timing count; ns units");
+NVACCEL_CNT(nvaccel_perf_total_ns, gPerfTotal.ns, "Intel total timing ns; ns units");
+NVACCEL_CNT(nvaccel_perf_total_max, gPerfTotal.max, "Intel total timing max; ns units");
+NVACCEL_CNT(nvaccel_perf_gap_bin0, gPerfBins[0], "Intel transaction interval histogram bucket 0");
+NVACCEL_CNT(nvaccel_perf_gap_bin1, gPerfBins[1], "Intel transaction interval histogram bucket 1");
+NVACCEL_CNT(nvaccel_perf_gap_bin2, gPerfBins[2], "Intel transaction interval histogram bucket 2");
+NVACCEL_CNT(nvaccel_perf_gap_bin3, gPerfBins[3], "Intel transaction interval histogram bucket 3");
+NVACCEL_CNT(nvaccel_perf_gap_bin4, gPerfBins[4], "Intel transaction interval histogram bucket 4");
+NVACCEL_CNT(nvaccel_perf_gap_bin5, gPerfBins[5], "Intel transaction interval histogram bucket 5");
 NVACCEL_CNT(nvaccel_iop_enter,        gCntIopEnter,       "calls into performTransaction");
 NVACCEL_CNT(nvaccel_iop_validate,     gCntIopValidate,    "calls into validateTransaction");
 NVACCEL_CNT(nvaccel_iop_ok_h0,        gCntIopOkHead[0],   "frames copied to head 0's panel");
@@ -1658,6 +1700,27 @@ static void nvaccelInstallSysctl(void)
     sysctl_register_oid(&sysctl__debug_nvaccel_map_free);
     sysctl_register_oid(&sysctl__debug_nvaccel_iop);
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_ok);         sysctl_register_oid(&sysctl__debug_nvaccel_iop_fail);
+    sysctl_register_oid(&sysctl__debug_nvaccel_perf_entry_count);
+    sysctl_register_oid(&sysctl__debug_nvaccel_perf_entry_ns);
+    sysctl_register_oid(&sysctl__debug_nvaccel_perf_entry_max);
+    sysctl_register_oid(&sysctl__debug_nvaccel_perf_fence_count);
+    sysctl_register_oid(&sysctl__debug_nvaccel_perf_fence_ns);
+    sysctl_register_oid(&sysctl__debug_nvaccel_perf_fence_max);
+    sysctl_register_oid(&sysctl__debug_nvaccel_perf_ready_count);
+    sysctl_register_oid(&sysctl__debug_nvaccel_perf_ready_ns);
+    sysctl_register_oid(&sysctl__debug_nvaccel_perf_ready_max);
+    sysctl_register_oid(&sysctl__debug_nvaccel_perf_copy_count);
+    sysctl_register_oid(&sysctl__debug_nvaccel_perf_copy_ns);
+    sysctl_register_oid(&sysctl__debug_nvaccel_perf_copy_max);
+    sysctl_register_oid(&sysctl__debug_nvaccel_perf_total_count);
+    sysctl_register_oid(&sysctl__debug_nvaccel_perf_total_ns);
+    sysctl_register_oid(&sysctl__debug_nvaccel_perf_total_max);
+    sysctl_register_oid(&sysctl__debug_nvaccel_perf_gap_bin0);
+    sysctl_register_oid(&sysctl__debug_nvaccel_perf_gap_bin1);
+    sysctl_register_oid(&sysctl__debug_nvaccel_perf_gap_bin2);
+    sysctl_register_oid(&sysctl__debug_nvaccel_perf_gap_bin3);
+    sysctl_register_oid(&sysctl__debug_nvaccel_perf_gap_bin4);
+    sysctl_register_oid(&sysctl__debug_nvaccel_perf_gap_bin5);
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_enter);      sysctl_register_oid(&sysctl__debug_nvaccel_iop_validate);
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_empty);
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_src_res);    sysctl_register_oid(&sysctl__debug_nvaccel_iop_src_surf);

@@ -26,18 +26,28 @@
 #include <IOKit/IOWorkLoop.h>
 #include <kern/thread_call.h>
 #include <sys/sysctl.h>
+#include "../NVRM/accel/nv_perf.h"
 
 #define IFBLOG(fmt, ...) IOLog("NMIntelFB: " fmt "\n", ##__VA_ARGS__)
 
 // kmutil places a kext in a kernel collection only with a _kmod_info symbol (Xcode generates it; this build does not)
 #include <mach/kmod.h>
+static NMPerfMetric gVblGap, gVblCallback;
+static SInt64 gVblPeriod;
+SYSCTL_QUAD(_debug, OID_AUTO, nmintel_perf_gap_count, CTLFLAG_RD | CTLFLAG_LOCKED, &gVblGap.count, "VBL gap_count, ns units");
+SYSCTL_QUAD(_debug, OID_AUTO, nmintel_perf_gap_ns, CTLFLAG_RD | CTLFLAG_LOCKED, &gVblGap.ns, "VBL gap_ns, ns units");
+SYSCTL_QUAD(_debug, OID_AUTO, nmintel_perf_gap_max, CTLFLAG_RD | CTLFLAG_LOCKED, &gVblGap.max, "VBL gap_max, ns units");
+SYSCTL_QUAD(_debug, OID_AUTO, nmintel_perf_callback_count, CTLFLAG_RD | CTLFLAG_LOCKED, &gVblCallback.count, "VBL callback_count, ns units");
+SYSCTL_QUAD(_debug, OID_AUTO, nmintel_perf_callback_ns, CTLFLAG_RD | CTLFLAG_LOCKED, &gVblCallback.ns, "VBL callback_ns, ns units");
+SYSCTL_QUAD(_debug, OID_AUTO, nmintel_perf_callback_max, CTLFLAG_RD | CTLFLAG_LOCKED, &gVblCallback.max, "VBL callback_max, ns units");
+SYSCTL_QUAD(_debug, OID_AUTO, nmintel_perf_period_ns, CTLFLAG_RD | CTLFLAG_LOCKED, &gVblPeriod, "Configured VBL period, ns");
 extern "C" kern_return_t _start(kmod_info_t *ki, void *d); extern "C" kern_return_t _stop(kmod_info_t *ki, void *d);
 #ifdef NMINTELFB_VIRTUAL
 extern "C" { KMOD_EXPLICIT_DECL(com.nullmoth.NMIntelFBVirtual, "0.1", _start, _stop) }
 #else
-extern "C" { KMOD_EXPLICIT_DECL(com.nullmoth.NMIntelFB, "0.1.3", _start, _stop) }
+extern "C" { KMOD_EXPLICIT_DECL(com.nullmoth.NMIntelFB, "0.1.4", _start, _stop) }
 #endif
-extern "C" kern_return_t _start(kmod_info_t *ki, void *d) { return KERN_SUCCESS; }
+extern "C" kern_return_t _start(kmod_info_t *ki, void *d) { sysctl_register_oid(&sysctl__debug_nmintel_perf_gap_count); sysctl_register_oid(&sysctl__debug_nmintel_perf_gap_ns); sysctl_register_oid(&sysctl__debug_nmintel_perf_gap_max); sysctl_register_oid(&sysctl__debug_nmintel_perf_callback_count); sysctl_register_oid(&sysctl__debug_nmintel_perf_callback_ns); sysctl_register_oid(&sysctl__debug_nmintel_perf_callback_max); sysctl_register_oid(&sysctl__debug_nmintel_perf_period_ns); return KERN_SUCCESS; }
 extern "C" kern_return_t _stop(kmod_info_t *ki, void *d)  { return KERN_SUCCESS; }
 
 namespace {
@@ -116,15 +126,19 @@ class NMIntelFB : public IOFramebuffer {
     IOMemoryMap *fSurfMap = nullptr;   // write-combined CPU view of the scan-out surface (NVIDIA frames land here)
     // WindowServer paces an accelerated display on its VBL interrupt: the NVIDIA display pipe completes each frame on it.
     // Without one the first frame never completed and WindowServer stalled every display (in testing, the
-    // virtual panel froze the Mac). A 60 Hz timer is the VBL, as NVRMFB's fallback is.
+    // virtual panel froze the Mac). The timer follows the measured panel period (60 Hz only as fallback).
     struct Irq { IOFBInterruptProc proc = nullptr; OSObject *target = nullptr; void *ref = nullptr; };
     Irq fVbl, fConnect;
     thread_call_t fVblTimer = nullptr;
-    uint64_t fVblNext = 0, fVblCalls = 0;
+    uint64_t fVblNext = 0, fVblCalls = 0, fPerfLastVbl = 0;
     volatile bool fStopping = false;
     static void vblFire(thread_call_param_t p0, thread_call_param_t) {
         NMIntelFB *me = (NMIntelFB *)p0;
         if (me->fStopping) return;
+        uint64_t fire = mach_absolute_time();
+        if (me->fPerfLastVbl) { uint64_t ns = 0; absolutetime_to_nanoseconds(fire - me->fPerfLastVbl, &ns); nmPerfAdd(gVblGap, ns); }
+        me->fPerfLastVbl = fire;
+        NMPerfScope callbackTime(&gVblCallback);
         if (me->fVbl.proc) { me->fVbl.proc(me->fVbl.target, me->fVbl.ref); me->fVblCalls++; }
         uint64_t period; nanoseconds_to_absolutetime(me->fFrameNs, &period);
         uint64_t now = mach_absolute_time();
@@ -134,7 +148,8 @@ class NMIntelFB : public IOFramebuffer {
     void armVbl() {
         if (!fVblTimer) fVblTimer = thread_call_allocate(vblFire, this);
         if (fVblTimer) { uint64_t d; clock_interval_to_deadline((uint32_t)(fFrameNs / 1000), kMicrosecondScale, &d); fVblNext = d; thread_call_enter_delayed(fVblTimer, d); }
-        IFBLOG("vbl timer %s", fVblTimer ? "armed (60 Hz)" : "ALLOCATE FAILED");
+        gVblPeriod = fFrameNs;
+        IFBLOG("vbl timer %s, configured period %llu ns", fVblTimer ? "armed" : "ALLOCATE FAILED", (unsigned long long)fFrameNs);
     }
 #ifdef NMINTELFB_VIRTUAL
     IOBufferMemoryDescriptor *fVBuf = nullptr;

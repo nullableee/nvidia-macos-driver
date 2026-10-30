@@ -14,6 +14,9 @@ extern int fflush(void *);
 extern int usleep(unsigned int);
 extern unsigned int alarm(unsigned int);
 extern char *strstr(const char *, const char *);
+#ifdef G6MF_LUT_PROBE
+extern void setprogname(const char *);
+#endif
 static void *send;
 static void *(*sel)(const char *);
 static Obj msg(Obj o, const char *s) { return ((Obj (*)(Obj,void *))send)(o,sel(s)); }
@@ -77,6 +80,10 @@ static int computeTest(Obj device, Obj (*cls)(const char *)) {
 }
 #endif
 int main(void) {
+#ifdef G6MF_LUT_PROBE
+ /* Exercise the WindowServer-only policy in a separate GPU test process. */
+ setprogname("WindowServer");
+#endif
 #ifdef G6MF_SHADER_PROBE
  alarm(240);
 #else
@@ -100,6 +107,11 @@ int main(void) {
  }
  fflush(0);
  if(!device) return fail("no NVIDIA Metal device; other GPUs do not count as success");
+#ifdef G6MF_LUT_PROBE
+ Size width=number(device,"maxTextureWidth1D");
+ printf("LUT CAP: %lu\n",width);fflush(0);
+ if(width!=1024)return fail("WindowServer test process did not see the experimental 1024 limit");
+#endif
  const Size bytes=4096;
  Obj src=((Obj (*)(Obj,void *,Size,Size))send)(device,sel("newBufferWithLength:options:"),bytes,0);
  Obj dst=((Obj (*)(Obj,void *,Size,Size))send)(device,sel("newBufferWithLength:options:"),bytes,0);
