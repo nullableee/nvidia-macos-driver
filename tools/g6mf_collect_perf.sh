@@ -106,6 +106,7 @@ awk -v seconds="$seconds" '
         }
         n = delta("debug.nmintel_perf_gap_count")
         ns = delta("debug.nmintel_perf_gap_ns")
+        if (ns > 0) printf "VBL counter window estimate=%.6f s; panel copies/window=%.2f copies/s (sequential snapshots, not application FPS)\n", ns/1000000000, frames*1000000000/ns
         printf "VBL configured period=%.4f ms, observed mean=%.4f ms, intervals=%.0f\n", after["debug.nmintel_perf_period_ns"]/1000000, n ? ns/n/1000000 : 0, n
         print "Transaction interval histogram: <7, 7-12, 12-20, 20-28, 28-40, >=40 ms"
         for (i = 0; i < 6; i++) {

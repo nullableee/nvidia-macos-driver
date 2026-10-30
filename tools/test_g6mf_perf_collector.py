@@ -28,4 +28,5 @@ for missing in [False,True]:
    assert result.returncode==0,result.stderr
    assert '397 over 20 s (19.85 copies/s)' in result.stdout,result.stdout
    assert 'copy: n=397 mean=2.0000 ms' in result.stdout,result.stdout
+   assert 'VBL counter window estimate=2.382000 s' in result.stdout,result.stdout
 print('PASS: real collector formats valid snapshots and refuses missing counters; mock Darwin tools, no hardware FPS assertion')
