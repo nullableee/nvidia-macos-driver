@@ -116,6 +116,9 @@ awk -v seconds="$seconds" '
     }
 ' "$OUT/before.txt" "$OUT/after.txt" | tee "$OUT/summary.txt"
 
+# Optional on v8; older measured drivers do not expose this switch.
+sysctl debug.nvaccel_muxless_copy64 > "$OUT/copy-mode.txt" 2> "$OUT/copy-mode-errors.txt" || true
+
 if [ -f "$HERE/collect-macos.sh" ]; then
     bash "$HERE/collect-macos.sh" "$OUT"
 else

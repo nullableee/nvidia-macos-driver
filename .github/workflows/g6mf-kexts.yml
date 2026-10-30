@@ -54,6 +54,8 @@ jobs:
             test_g6mf_perf_collector \
             test_g6mf_perf \
             test_g6mf_cpu_scanout \
+            test_g6mf_copy64 \
+            test_g6mf_compare_copy \
             test_g6mf_muxless \
             test_g6mf_probe_efi \
             test_g6mf_macho \

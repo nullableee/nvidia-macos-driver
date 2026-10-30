@@ -117,7 +117,7 @@ extern "C" kern_return_t _start(kmod_info_t *ki, void *d); extern "C" kern_retur
 #ifdef NMX_ACCEL
 extern "C" { KMOD_EXPLICIT_DECL(com.nullmoth.NMXAccel, "0.1", _start, _stop) }
 #else
-extern "C" { KMOD_EXPLICIT_DECL(com.nullmoth.NVAccel, "0.1.3", _start, _stop) }
+extern "C" { KMOD_EXPLICIT_DECL(com.nullmoth.NVAccel, "0.1.4", _start, _stop) }
 #endif
 extern "C" kern_return_t _start(kmod_info_t *ki, void *d) { return KERN_SUCCESS; }
 extern "C" kern_return_t _stop(kmod_info_t *ki, void *d)  { return KERN_SUCCESS; }
@@ -1340,6 +1340,10 @@ static bool nvAccelSurfCopyReady(IOSurface *s, unsigned head);
 static bool nvAccelIopFlip(IOService *fb, unsigned head, IOSurface *s, void *pipe);
 static bool nvSurfWaitReady(unsigned int id);
 static void nvAccelIopHome(IOService *fb, unsigned head);
+// Default to the measured v6/v7 algorithm until the explicit A/B test enables it.
+static int gNvMuxlessCopy64;
+SYSCTL_INT(_debug, OID_AUTO, nvaccel_muxless_copy64, CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_KERN,
+           &gNvMuxlessCopy64, 0, "1 = experimental aligned 64-bit Intel scanout copy; otherwise original 32-bit copy");
 IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
 {
     OSAddAtomic64(1, &gCntIopEnter);
@@ -1432,7 +1436,8 @@ IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
     if (muxless) {
         NMPerfScope copyTime(perfIntel ? &gPerfCopy : nullptr);
         if (!nvMuxlessCopy((volatile uint32_t *)q.kva, q.actualSize, q.pitch, src,
-                           (uint64_t)pitch * h, pitch, w, h))
+                           (uint64_t)pitch * h, pitch, w, h,
+                           __atomic_load_n(&gNvMuxlessCopy64, __ATOMIC_RELAXED) == 1))
             NVIOP_FAIL(kIOReturnOverrun, "Intel scanout copy geometry/capacity refused");
     }
     const unsigned words = muxless ? 0 : (((pitch < q.pitch) ? pitch : q.pitch) & ~3u) / 4;
@@ -1699,6 +1704,7 @@ static void nvaccelInstallSysctl(void)
     sysctl_register_oid(&sysctl__debug_nvaccel_map_commit);     sysctl_register_oid(&sysctl__debug_nvaccel_map_release);
     sysctl_register_oid(&sysctl__debug_nvaccel_map_free);
     sysctl_register_oid(&sysctl__debug_nvaccel_iop);
+    sysctl_register_oid(&sysctl__debug_nvaccel_muxless_copy64);
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_ok);         sysctl_register_oid(&sysctl__debug_nvaccel_iop_fail);
     sysctl_register_oid(&sysctl__debug_nvaccel_perf_entry_count);
     sysctl_register_oid(&sysctl__debug_nvaccel_perf_entry_ns);

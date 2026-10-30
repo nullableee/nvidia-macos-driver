@@ -10,10 +10,11 @@ assert sha(binary)==m['binaries']['NMIntelFB']['sha256']
 version=plistlib.loads((bundle/'Contents/Info.plist').read_bytes())['CFBundleVersion']
 assert version in ('0.1.3','0.1.4')
 perf=version=='0.1.4'
+copy8=perf and plistlib.loads((a.build/'NVAccel.kext/Contents/Info.plist').read_bytes())['CFBundleVersion']=='0.1.4'
 assert struct.unpack_from('<4I',a.shader_probe.read_bytes())[:2]==(0xfeedfacf,0x01000007)
 assert struct.unpack_from('<4I',a.shader_probe.read_bytes())[3]==2
 subprocess.run([sys.executable,str(R/'tools/validate_g6mf_kext.py'),str(bundle)],check=True)
-kit=a.out.resolve()/('NullMoth-G6MF-Bridge-v6-Perf' if perf else 'NullMoth-G6MF-Bridge-v5')
+kit=a.out.resolve()/('NullMoth-G6MF-Bridge-v8-Copy' if copy8 else 'NullMoth-G6MF-Bridge-v6-Perf' if perf else 'NullMoth-G6MF-Bridge-v5')
 if kit.exists():p.error('Kit directory exists; choose fresh output')
 kit.mkdir(parents=True);(kit/'validation').mkdir()
 shutil.copytree(bundle,kit/bundle.name)
@@ -40,6 +41,13 @@ if perf:
  shutil.copy2(R/'tools/g6mf_profile_perf.sh',kit/'profile-perf.sh')
  shutil.copy2(R/'docs/G6MF-PERF-V6-RU.md',kit/'README-RU.md')
  for unused in ('next-stage.sh','prepare-bridge.py'):(kit/unused).unlink()
+ if copy8:
+  identity.update(name='G6MF copy comparison v8',old_accel_sha='266e66bc9ddb584caa137fe2bdcfefb54c11210ef28942f05615bf4f687540c6',fix='opt-in aligned 64-bit CPU copy, original 32-bit mode by default')
+  shutil.copy2(R/'tools/g6mf_compare_copy.sh',kit/'compare-copy.sh')
+  shutil.copy2(R/'docs/G6MF-COPY-V8-RU.md',kit/'README-RU.md')
+  entry=kit/'install-copy.sh'
+  entry.write_text((kit/'install-perf.sh').read_text().replace('PERF UPDATE READY. EFI unchanged. Reboot, then run collect-perf.sh.','COPY UPDATE READY. EFI unchanged. Reboot, then run compare-copy.sh.'))
+  (kit/'install-perf.sh').unlink()
  variables={'OLD_KEXT_SHA':identity['old_kext_sha'],'NEW_KEXT_SHA':identity['new_kext_sha'],'OLD_ACCEL_SHA':identity['old_accel_sha'],'NEW_ACCEL_SHA':identity['new_accel_sha'],'OLD_AGDC_SHA':identity['old_agdc_sha'],'NEW_AGDC_SHA':identity['new_agdc_sha']}
  (kit/'plan.env').write_text(''.join(k+'='+v+'\n' for k,v in variables.items()))
 (kit/'validation/update-identity.json').write_text(json.dumps(identity,indent=2)+'\n')
