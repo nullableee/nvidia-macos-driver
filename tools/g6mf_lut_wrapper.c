@@ -31,9 +31,15 @@ static unsigned long long limitedWidth(void *self,void *selector) {
         syslog(5,"G6MF-LUT: maxTextureWidth1D original=%llu advertised=%llu; WindowServer-only experiment",base,result);
     return result;
 }
+#ifdef G6MF_SERIAL_LUT
+extern void g6mfInstallLUTSerial(void);
+#endif
 __attribute__((constructor)) static void loadOriginal(void) {
     void *real=dlopen(REAL_PLUGIN,2|8); /* RTLD_NOW | RTLD_GLOBAL */
     if(!real){syslog(3,"G6MF-LUT: original plugin load failed: %s",dlerror());return;}
+    #ifdef G6MF_SERIAL_LUT
+    g6mfInstallLUTSerial();
+    #endif
     const char *process=getprogname();
     if(!process||strcmp(process,"WindowServer"))return;
     char text[32];int fd=open(CONFIG,0);if(fd<0)return;

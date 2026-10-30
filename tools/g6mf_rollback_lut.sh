@@ -20,5 +20,9 @@ if ! mv "$stage" "$PLUGIN";then [ ! -e "$park" ] || mv "$park" "$PLUGIN";exit 1;
 if [ -e "$park" ];then mv "$park" "$BACKUP/failed-bundle-$$";fi
 CONFIG="$ROOT/Library/NullMoth/g6mf-lut-limit"
 if [ -f "$BACKUP/lut-limit" ];then cp -p "$BACKUP/lut-limit" "$CONFIG";else rm -f "$CONFIG";fi
+if [ -f "$BACKUP/serial-config-managed" ];then
+ SERIAL="$ROOT/Library/NullMoth/g6mf-lut-serial"
+ if [ -f "$BACKUP/lut-serial" ];then cp -p "$BACKUP/lut-serial" "$SERIAL";else rm -f "$SERIAL";fi
+fi
 sync
 echo 'Original Metal bundle restored. Reboot; EFI and kernel collection were not changed.'

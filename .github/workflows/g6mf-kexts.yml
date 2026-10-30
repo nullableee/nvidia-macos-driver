@@ -49,6 +49,8 @@ jobs:
         run: |
           mkdir -p test-logs
           for test in \
+            test_g6mf_lut_serial \
+            test_g6mf_serial_install \
             test_g6mf_lut_wrapper \
             test_g6mf_lut_install \
             test_g6mf_perf_collector \
@@ -228,4 +230,24 @@ jobs:
             lut-build/NVMTLDriver
             lut-build/lut-probe
             lut-build/build-manifest.json
+          if-no-files-found: error
+
+  serial-lut:
+    name: Build serial LUT experiment
+    runs-on: macos-26-intel
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+      - name: Build serial wrapper and both probes
+        run: python3 tools/build_g6mf_lut.py --serial --out serial-build
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: g6mf-serial-lut-${{ github.sha }}
+          path: |
+            serial-build/NVMTLDriver
+            serial-build/serial-probe
+            serial-build/lut-probe
+            serial-build/build-manifest.json
           if-no-files-found: error
