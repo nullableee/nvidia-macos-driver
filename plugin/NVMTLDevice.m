@@ -26,6 +26,7 @@
 #include "nvmtl_log_failure.h"
 #include <sys/sysctl.h>
 #import <libproc.h>
+#import <mach-o/dyld.h>
 #ifndef NVMTL_RELEASE
 #define NVMTL_RELEASE 0
 #endif
@@ -509,6 +510,10 @@ static void nvmtl_nvenc_hevc_register(void)
 // get it by default: without it their GPU process cannot start. Electron stays opt-in (NVMTL_ANGLE_METAL=1) because it showed artifacts,
 // stutter and lost transparency on several cards. NVMTL_ANGLE_METAL=0 turns the rule off in every process. An existing
 // ANGLE override is kept; no sandbox setting is changed.
+// Matched three ways: by process name, by the frameworks in the app bundle, and by ANGLE's own libraries
+// (libGLESv2.dylib, libEGL.dylib) already loaded in the process. The loaded-library check covers Chromium-based apps
+// whose names and bundles the first two miss (Vivaldi, Opera, Arc and other CEF hosts). It is an addition, not a
+// replacement: a process that creates its Metal device before ANGLE is loaded is still matched by the first two.
 static bool nvmtl_angle_chrome_family(void)
 {
     const char *me = getprogname();
@@ -525,35 +530,41 @@ static bool nvmtl_angle_chrome_family(void)
         return true;
     }
 
-    // 2. Deep Path: Precise inspection based on file path features (mapping find command rules)
+    // 2. By the frameworks the app bundle ships.
     char path[PATH_MAX];
-    if (proc_pidpath(getpid(), path, sizeof(path)) <= 0) {
-        return false;
+    if (proc_pidpath(getpid(), path, sizeof(path)) > 0) {
+        char app_path[PATH_MAX];
+        strlcpy(app_path, path, sizeof(app_path));
+
+        char *p = strstr(app_path, ".app");
+        if (p != NULL) {
+            *(p + 4) = '\0'; // Truncate to the root directory of .app
+
+            char check_buf[PATH_MAX];
+
+            snprintf(check_buf, sizeof(check_buf), "%s/Contents/Frameworks/libEGL.dylib", app_path);
+            if (access(check_buf, F_OK) == 0) return true;
+
+            snprintf(check_buf, sizeof(check_buf), "%s/Contents/Frameworks/Chromium Embedded Framework.framework", app_path);
+            if (access(check_buf, F_OK) == 0) return true;
+
+            snprintf(check_buf, sizeof(check_buf), "%s/Contents/Frameworks/Electron Framework.framework", app_path);
+            if (access(check_buf, F_OK) == 0) return true;
+
+            snprintf(check_buf, sizeof(check_buf), "%s/Contents/Frameworks/libffmpeg.dylib", app_path);
+            if (access(check_buf, F_OK) == 0) return true;
+        }
     }
 
-    char app_path[PATH_MAX];
-    strlcpy(app_path, path, sizeof(app_path));
-
-    char *p = strstr(app_path, ".app");
-    if (p != NULL) {
-        *(p + 4) = '\0'; // Truncate to the root directory of .app
-
-        char check_buf[PATH_MAX];
-
-        // Corresponding to the full feature checks in the find command
-        snprintf(check_buf, sizeof(check_buf), "%s/Contents/Frameworks/libEGL.dylib", app_path);
-        if (access(check_buf, F_OK) == 0) return true;
-
-        snprintf(check_buf, sizeof(check_buf), "%s/Contents/Frameworks/Chromium Embedded Framework.framework", app_path);
-        if (access(check_buf, F_OK) == 0) return true;
-
-        snprintf(check_buf, sizeof(check_buf), "%s/Contents/Frameworks/Electron Framework.framework", app_path);
-        if (access(check_buf, F_OK) == 0) return true;
-
-        snprintf(check_buf, sizeof(check_buf), "%s/Contents/Frameworks/libffmpeg.dylib", app_path);
-        if (access(check_buf, F_OK) == 0) return true;
+    // 3. By ANGLE's libraries in the process.
+    const uint32_t n = _dyld_image_count();
+    for (uint32_t i = 0; i < n; i++) {
+        const char *img = _dyld_get_image_name(i);
+        if (!img) continue;
+        const char *base = strrchr(img, '/');
+        base = base ? base + 1 : img;
+        if (!strcmp(base, "libGLESv2.dylib") || !strcmp(base, "libEGL.dylib")) return true;
     }
-
     return false;
 }
 __attribute__((constructor)) static void nvmtl_angle_allow_nvidia(void)
@@ -779,6 +790,10 @@ static int nvmtl_pixfmt(MTLPixelFormat f, uint32_t *vk, uint32_t *bpp, int *a8)
     *a8 = 0;
     switch (f) {
     case MTLPixelFormatA8Unorm:          *vk = 9  ;               *bpp = 1;  *a8 = 1; return 0;
+    // Apple's private ARGB8 format: AppleMetalOpenGLRenderer asks for it when a GL_RGBA8 texture is uploaded as GL_BGRA +
+    // GL_UNSIGNED_INT_8_8_8_8 (bytes A,R,G,B; Unity 5's ARGB32 textures). Stored as RGBA8, the view swizzle reorders it
+    // (a8 = 2). WAS nil, so the GL texture was "unloadable" and sampled as zero: Homeworld: Deserts of Kharak's UI sprites.
+    case (MTLPixelFormat)84:             *vk = 37 ;         *bpp = 4;  *a8 = 2; return 0;
     case MTLPixelFormatR8Unorm:          *vk = 9  ;               *bpp = 1;  return 0;
     case MTLPixelFormatR8Unorm_sRGB:     *vk = 15 ;                *bpp = 1;  return 0;
     case MTLPixelFormatR8Snorm:          *vk = 10 ;               *bpp = 1;  return 0;
@@ -1105,6 +1120,22 @@ static int nvmtl_surface_reuse_mode(void) {
     return value;
 }
 static bool nvmtl_live_surface_reuse(void) { return nvmtl_surface_reuse_mode() != 0; }
+
+// A CAMetalLayer drawable with framebufferOnly=NO is, on real Metal, usable as a render target AND a compute/Core Image
+// destination. QuartzCore hands this driver a descriptor whose usage is only ShaderRead for it, so Core Image refuses the
+// texture ("texture usage must include MTLTextureUsageShaderWrite") and Photo Booth's preview stays black. The surface's
+// image is already writable whenever its format allows (see nvmtl_surface_image_create), so say so.
+// WindowServer keeps the usage it asked for: it wraps hundreds of surfaces a second, none of them Core Image targets.
+static NSUInteger nvmtl_surface_usage(NSUInteger usage, BOOL fbo, BOOL storage) {
+    static int ws = -1;
+    if (ws < 0) { const char *me = getprogname(); ws = me && !strcmp(me, "WindowServer"); }
+    if (!fbo && !ws) {
+        usage |= MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget;
+        if (storage) usage |= MTLTextureUsageShaderWrite;
+    }
+    return usage;
+}
+
 static char nvmtl_surface_cache_key;
 static char g6mf_surface_recent_key;
 static char g6mf_surface_hold_key;
@@ -1275,7 +1306,7 @@ static void g6mf_surface_finished(id device) {
         NVMTLTexture *alias = (NVMTLTexture *)[backing newTextureViewWithPixelFormat:d.pixelFormat];
         if (alias) {
             g6mf_surface_count(backing->_vramOn ? G6SurfaceHitVram : G6SurfaceHitPrivate);
-            alias->_viewParent = nil; alias->_usage = d.usage; alias->_ropt = ropt; alias->_fbo = fbo;
+            alias->_viewParent = nil; alias->_usage = nvmtl_surface_usage(d.usage, fbo, alias->_stex); alias->_ropt = ropt; alias->_fbo = fbo;
             nvmtl_texture_desc_swizzle(alias, d);
             g6mf_surface_hold(self, key, backing);
             g6mf_surface_finished(self);
@@ -1293,7 +1324,7 @@ static void g6mf_surface_finished(id device) {
     t->_plane = plane;
     t->_fmt = d.pixelFormat;
     t->_stex = t->_i.storage != 0;
-    t->_usage = d.usage;
+    t->_usage = nvmtl_surface_usage(d.usage, t->_fbo, t->_stex);
     nvmtl_texture_desc_swizzle(t, d);
     if (key && (!t->_vramOn || nvmtl_live_surface_reuse())) [cache setObject:t forKey:key];
     g6mf_surface_hold(self, key, t);
@@ -1788,6 +1819,10 @@ void nvmtl_gl_tag_reflection(id refl, MTLRenderPipelineDescriptor *d);
         uint32_t svk = 0, sbpp = 0; int sa8 = 0;
         if (nvmtl_pixfmt(ca.pixelFormat, &svk, &sbpp, &sa8))
             return nvmtl_fail(err, [NSString stringWithFormat:@"pipeline: colour attachment %u pixel format %lu not carried by this driver", i, (unsigned long)ca.pixelFormat]);
+        // ARGB8 (84) is sampled through a reordering view swizzle, which a colour attachment does not get, and the A8
+        // remapping below would treat it as a one-channel target. Refused, as it was before the format was carried.
+        if (sa8 == 2)
+            return nvmtl_fail(err, [NSString stringWithFormat:@"pipeline: colour attachment %u pixel format %lu (ARGB8) is not carried as a render target", i, (unsigned long)ca.pixelFormat]);
         if (nvmtl_blend_from(ca, noFrag, sa8, &rt.blend[i]))
             return nvmtl_fail(err, [NSString stringWithFormat:@"pipeline: colour attachment %u has a blend factor or operation this driver cannot translate (the reason is the preceding \"blend:\" log line)", i]);
         if (sa8) {

@@ -18,13 +18,17 @@ static void nvtrace_emit(const char *fmt, ...) __attribute__((format(printf, 1, 
 // Guard the call site: converting NSString arguments on every draw is expensive
 // even when the trace writer immediately returns without emitting anything.
 #define nvtrace(...) do { if (nvmtl_trace_on()) nvtrace_emit(__VA_ARGS__); } while (0)
+// A private lock, not @synchronized on the object: the object is the app's (a command buffer, an encoder), and an app that
+// holds @synchronized on it while it waits for the scheduled handler deadlocked against the Metal HUD, which asks for the ID
+// from that handler (Unity games with MetalForceHudEnabled: Soulstone Survivors hung on a black screen at start).
 static unsigned long long nvmtl_global_trace_id(id o) {
-    static char key; static unsigned long long next = 1;
-    @synchronized (o) {
-        NSNumber *n = objc_getAssociatedObject(o, &key);
-        if (!n) { n = @(__atomic_fetch_add(&next, 1, __ATOMIC_RELAXED)); objc_setAssociatedObject(o, &key, n, OBJC_ASSOCIATION_RETAIN_NONATOMIC); }
-        return n.unsignedLongLongValue;
-    }
+    static char key; static unsigned long long next = 1; static os_unfair_lock lock = OS_UNFAIR_LOCK_INIT;
+    os_unfair_lock_lock(&lock);
+    NSNumber *n = objc_getAssociatedObject(o, &key);
+    if (!n) { n = @(__atomic_fetch_add(&next, 1, __ATOMIC_RELAXED)); objc_setAssociatedObject(o, &key, n, OBJC_ASSOCIATION_RETAIN_NONATOMIC); }
+    const unsigned long long id = n.unsignedLongLongValue;
+    os_unfair_lock_unlock(&lock);
+    return id;
 }
 @protocol NVMTLFunctionConstantInit
 - (instancetype)initWithName:(NSString *)name type:(NSUInteger)type index:(NSUInteger)index required:(BOOL)required;
@@ -88,6 +92,8 @@ __attribute__((constructor)) static void nvmtl_conf_knobs(void)
               // Preserve the GL uniform path's per-process override and diagnostics.
               if (!strncmp(*e, "NVMTL_UNIFORM_CBUF=", 19)
                   || !strncmp(*e, "NVMTL_UNIFORM_CBUF_STATS=", 25)) continue;
+              // Keep the switch that restores inline presents.
+              if (!strncmp(*e, "NVMTL_PRESENT_INLINE=", 21)) continue;
               const char *eq = strchr(*e, '='); if (!eq) continue;
               names[n] = strndup(*e, (size_t)(eq - *e)); if (names[n]) n++; }
       for (unsigned i = 0; i < n; i++) { unsetenv(names[i]); free(names[i]); } }
@@ -1978,6 +1984,16 @@ static NSArray *nvmtl_vertex_attributes_for(NVMTLFunction *fn) {
 - (NSArray *)members { return _members ?: @[]; }
 - (id)memberByName:(NSString *)n { for (NVMTLStructMember *m in _members) if ([m->_name isEqualToString:n]) return m; return nil; }
 @end
+@implementation NVMTLArrayType
+- (MTLDataType)elementType { return _elem; }
+- (NSUInteger)arrayLength { return _len; }
+- (NSUInteger)stride { return _stride; }
+- (NSUInteger)argumentIndexStride { return 0; }
+- (id)elementStructType { return nil; }
+- (id)elementArrayType { return nil; }
+- (id)elementTextureReferenceType { return nil; }
+- (id)elementPointerType { return nil; }
+@end
 @implementation NVMTLPointerType
 - (MTLDataType)elementType { return _elem; }
 - (MTLBindingAccess)access { return _access; }
@@ -1993,7 +2009,7 @@ static NSArray *nvmtl_vertex_attributes_for(NVMTLFunction *fn) {
 - (MTLDataType)dataType { return _dataType; }
 - (NSUInteger)argumentIndex { return _argIndex; }
 - (id)structType { return _struct; }
-- (id)arrayType { return nil; }
+- (id)arrayType { return _arr; }
 - (id)textureReferenceType { return _texRef; }
 - (id)pointerType { return _ptr; }
 - (NSString *)description { return [NSString stringWithFormat:@"<member %@ id %lu off %lu type %lu>", _name, (unsigned long)_argIndex, (unsigned long)_offset, (unsigned long)_dataType]; }
@@ -2077,6 +2093,14 @@ static MTLTextureType nvmtl_textype_for_shape(id shape) {
     if ([s rangeOfString:@"Multisample"].location != NSNotFound || [s rangeOfString:@"MS"].location != NSNotFound) return MTLTextureType2DMultisample;
     return [s rangeOfString:@"Array"].location != NSNotFound ? MTLTextureType2DArray : MTLTextureType2D;
 }
+// texture2d<uint, sample> -> UInt, <int ...> -> Int, <half ...> -> Half, anything else (float, depth, unknown) -> Float
+static MTLDataType nvmtl_texdatatype_for_air_name(NSString *tn) {
+    if (![tn isKindOfClass:[NSString class]]) return MTLDataTypeFloat;
+    if ([tn rangeOfString:@"<uint"].location != NSNotFound || [tn rangeOfString:@"<ushort"].location != NSNotFound) return MTLDataTypeUInt;
+    if ([tn rangeOfString:@"<int"].location != NSNotFound || [tn rangeOfString:@"<short"].location != NSNotFound) return MTLDataTypeInt;
+    if ([tn rangeOfString:@"<half"].location != NSNotFound) return MTLDataTypeHalf;
+    return MTLDataTypeFloat;
+}
 static BOOL nvmtl_binding_active(NSDictionary *b) { id acc = b[@"access"]; return !([acc isKindOfClass:[NSString class]] && [acc isEqualToString:@"Unused"]); }
 static NVMTLArgument *nvmtl_build_buffer_argument(NVMTLFunction *fn, NSUInteger index, NSDictionary *binding, NSDictionary *refl, NSDictionary *names) {
     NVMTLArgument *a = [NVMTLBufferArgument new];
@@ -2123,7 +2147,13 @@ static NVMTLArgument *nvmtl_build_buffer_argument(NVMTLFunction *fn, NSUInteger 
             m->_offset = [am[@"off"] unsignedLongValue]; m->_argIndex = i++; m->_name = am[@"name"];
             m->_dataType = nvmtl_datatype_for_air_name(am[@"type"]);
             if (m->_dataType == MTLDataTypeNone) m->_dataType = MTLDataTypeStruct;
-            NSUInteger e = m->_offset + [am[@"size"] unsignedLongValue]; if (e > end) end = e;
+            // struct_type_info gives the element size and an element count (0 = not an array). An array is reported as
+            // Apple does, MTLDataTypeArray with its MTLArrayType: engines size their uniform copies from it. WAS: the element
+            // alone, so Hades (The Forge) copied one float4x4 of its float4x4[2] and every screen-space sprite read zeros.
+            NSUInteger cnt = [am[@"count"] unsignedLongValue], sz = [am[@"size"] unsignedLongValue];
+            if (cnt > 1) { NVMTLArrayType *at = [NVMTLArrayType new]; at->_dataType = MTLDataTypeArray; at->_elem = m->_dataType; at->_len = cnt; at->_stride = sz;
+                m->_arr = at; m->_dataType = MTLDataTypeArray; }
+            NSUInteger e = m->_offset + sz * (cnt > 1 ? cnt : 1); if (e > end) end = e;
             [members addObject:m];
         }
     }
@@ -2175,7 +2205,14 @@ NSArray<NVMTLArgument *> *nvmtl_arguments_for_function(NVMTLFunction *fn)
                 NVMTLArgument *a = [NVMTLTextureArgument new]; a->_type = MTLArgumentTypeTexture; a->_index = idx; a->_active = nvmtl_binding_active(b);
                 a->_name = names[@"args"][[NSString stringWithFormat:@"texture:%lu", (unsigned long)idx]] ?: [NSString stringWithFormat:@"texture%lu", (unsigned long)idx];
                 a->_access = [kind isEqualToString:@"StorageImage"] ? MTLBindingAccessReadWrite : nvmtl_access_for(b[@"access"]);
-                a->_texType = nvmtl_textype_for_shape(b[@"texture_shape"]); a->_texDataType = MTLDataTypeFloat;
+                a->_texType = nvmtl_textype_for_shape(b[@"texture_shape"]);
+                // The AIR type name says what MTLArgument does: depth2d/depthcube/... is a depth texture, <uint>/<int>/<half>
+                // the component type. Apple's GL picks a texture unit's sampler type from these two: with isDepthTexture NO
+                // a sampler2DShadow unit counts as Float and its shader-side compare swizzle (texInfo) stays all Zero, so
+                // every shadow lookup returned 0 (Unity's screen-space shadows, Northgard's lit ground: black).
+                NSString *ttn = names[@"types"][[NSString stringWithFormat:@"texture:%lu", (unsigned long)idx]];
+                a->_depth = [ttn isKindOfClass:[NSString class]] && [ttn rangeOfString:@"depth"].location != NSNotFound;
+                a->_texDataType = nvmtl_texdatatype_for_air_name(ttn);
                 id loc = b[@"descriptor"]; a->_arrayLength = [loc isKindOfClass:[NSDictionary class]] && [loc[@"count"] unsignedLongValue] > 1 ? [loc[@"count"] unsignedLongValue] : 1;
                 [out addObject:a];
             } else if ([kind isEqualToString:@"Sampler"]) {
@@ -2888,6 +2925,7 @@ static BOOL nvmtl_pixel_sampler_update(NSMutableDictionary *states, NSString *in
         _pass.colfmt[i] = tvk;
         MTLClearColor cc = ca.clearColor;   // an A8 target keeps Metal's alpha in its red lane, its clear too
         _pass.clear[i][0] = ta8 ? (float)cc.alpha : (float)cc.red; _pass.clear[i][1] = (float)cc.green; _pass.clear[i][2] = (float)cc.blue; _pass.clear[i][3] = (float)cc.alpha;
+        if (ta8 == 2) { _pass.clear[i][0] = (float)cc.alpha; _pass.clear[i][1] = (float)cc.red; _pass.clear[i][2] = (float)cc.green; _pass.clear[i][3] = (float)cc.blue; }   // ARGB8 stored as RGBA8
         if (nvmtl_load_keeps(ca.loadAction)) load |= NVMTL_LOAD_COLOUR(i);
         if (cw < w) w = cw;
         if (ch < h) h = ch;
@@ -3608,6 +3646,10 @@ static NVMTLBuffer *nvmtl_bytes_ring(NVMTLCommandBuffer *cb, NSUInteger len, siz
 - (void)setLabel:(NSString *)l { _label = [l copy]; }
 - (NSString *)label { return _label; }
 - (id<MTLDevice>)device { id<MTLDevice> d = _cb ? [_cb device] : nil; return d ? d : (id<MTLDevice>)gNVMTLMainDevice; }
+// -commandBuffer is SPI on Apple's encoders (_MTLCommandEncoder), not in the MTLCommandEncoder protocol, but apps call it:
+// Hades asks every render encoder for its command buffer each frame; the forwarding stub answered nil and messages to the
+// nil command buffer did nothing. The encoder keeps _cb after endEncoding, so it answers then too, as Apple's does.
+- (id<MTLCommandBuffer>)commandBuffer { return (id<MTLCommandBuffer>)_cb; }
 - (void)setColorStoreAction:(MTLStoreAction)a atIndex:(NSUInteger)i {
     BOOL resolve = a == MTLStoreActionMultisampleResolve || a == MTLStoreActionStoreAndMultisampleResolve;
     BOOL planned = i < NVMTL_NCOL && _pass.res[i] != NULL;
@@ -4722,6 +4764,7 @@ static void nvmtl_zprobe_drain(void) {
 - (void)setLabel:(NSString *)l { _label = [l copy]; }
 - (NSString *)label { return _label; }
 - (id<MTLDevice>)device { id<MTLDevice> d = _cb ? [_cb device] : nil; return d ? d : (id<MTLDevice>)gNVMTLMainDevice; }
+- (id<MTLCommandBuffer>)commandBuffer { return (id<MTLCommandBuffer>)_cb; }   // SPI, see the render encoder
 @end
 
 static NSUInteger nvmtl_texture_slice_count(NVMTLTexture *t) {
@@ -4956,6 +4999,7 @@ destinationBytesPerImage:(NSUInteger)img options:(MTLBlitOption)opt {
 - (void)setLabel:(NSString *)l { _label = [l copy]; }
 - (NSString *)label { return _label; }
 - (id<MTLDevice>)device { id<MTLDevice> d = _cb ? [_cb device] : nil; return d ? d : (id<MTLDevice>)gNVMTLMainDevice; }
+- (id<MTLCommandBuffer>)commandBuffer { return (id<MTLCommandBuffer>)(_cb ? _cb : _owner); }   // SPI, see the render encoder; _cb is gone after endEncoding
 @end
 
 #pragma mark - command buffer / queue
@@ -5136,11 +5180,11 @@ destinationBytesPerImage:(NSUInteger)img options:(MTLBlitOption)opt {
 - (id<MTLResourceStateCommandEncoder>)resourceStateCommandEncoderWithDescriptor:(MTLResourceStatePassDescriptor *)d { return nil; }
 - (id<MTLBlitCommandEncoder>)blitCommandEncoder {
     nvmtl_g79_flush(self);
-    NVMTLBlitCommandEncoder *e = [NVMTLBlitCommandEncoder new]; e->_cb = self; _nEnc++; return e;
+    NVMTLBlitCommandEncoder *e = [NVMTLBlitCommandEncoder new]; e->_cb = self; e->_owner = self; _nEnc++; return e;
 }
 - (id<MTLAccelerationStructureCommandEncoder>)accelerationStructureCommandEncoder {
     nvmtl_g79_flush(self);
-    NVMTLAccelerationStructureCommandEncoder *e = [NVMTLAccelerationStructureCommandEncoder new]; e->_cb = self; _nEnc++; return e;
+    NVMTLAccelerationStructureCommandEncoder *e = [NVMTLAccelerationStructureCommandEncoder new]; e->_cb = self; e->_owner = self; _nEnc++; return e;
 }
 - (id<MTLAccelerationStructureCommandEncoder>)accelerationStructureCommandEncoderWithDescriptor:(MTLAccelerationStructurePassDescriptor *)d { return [self accelerationStructureCommandEncoder]; }
 - (void)addCompletedHandler:(MTLCommandBufferHandler)h {
@@ -5457,6 +5501,7 @@ static int nvp_fast_off(void) {
 - (BOOL)conformsToProtocol:(Protocol *)p { return [NVMTLRenderCommandEncoder conformsToProtocol:p]; }
 - (id<MTLDevice>)device { return gNVMTLMainDevice; }
 - (NSString *)label { return _label; }
+- (id<MTLCommandBuffer>)commandBuffer { NVMTLParallelRenderCommandEncoder *p = _owner; return p ? (id<MTLCommandBuffer>)p->_cb : nil; }   // SPI; answered here, not recorded for replay
 - (void)setLabel:(NSString *)l { _label = [l copy]; }
 - (void)setVertexBuffers:(const id<MTLBuffer> __unsafe_unretained [])b offsets:(const NSUInteger *)o withRange:(NSRange)r { for (NSUInteger k = 0; k < r.length; k++) if (b[k]) [(id)self setVertexBuffer:b[k] offset:o ? o[k] : 0 atIndex:r.location + k]; }
 - (void)setVertexBuffers:(const id<MTLBuffer> __unsafe_unretained [])b offsets:(const NSUInteger *)o attributeStrides:(const NSUInteger *)s withRange:(NSRange)r { for (NSUInteger k = 0; k < r.length; k++) if (b[k]) [(id)self setVertexBuffer:b[k] offset:o ? o[k] : 0 attributeStride:s ? s[k] : MTLAttributeStrideStatic atIndex:r.location + k]; }
@@ -5555,6 +5600,7 @@ static int nvp_fast_off(void) {
 }
 - (id<MTLDevice>)device { return gNVMTLMainDevice; }
 - (NSString *)label { return _label; }
+- (id<MTLCommandBuffer>)commandBuffer { return (id<MTLCommandBuffer>)_cb; }   // SPI, see the render encoder
 - (void)setLabel:(NSString *)l { _label = [l copy]; }
 - (void)setColorStoreAction:(MTLStoreAction)a atIndex:(NSUInteger)i { _desc.colorAttachments[i].storeAction = a; }
 - (void)setDepthStoreAction:(MTLStoreAction)a { _desc.depthAttachment.storeAction = a; }
@@ -5642,6 +5688,7 @@ uint32_t nvmtl_geoms_from_descriptor(id desc, nvmtl_geom *out, uint32_t max, int
 
 @implementation NVMTLAccelerationStructureCommandEncoder
 - (id<MTLDevice>)device { return _cb->_queue->_dev; }
+- (id<MTLCommandBuffer>)commandBuffer { return (id<MTLCommandBuffer>)(_cb ? _cb : _owner); }   // SPI, see the render encoder
 - (NSString *)label { return _label; }
 - (void)setLabel:(NSString *)l { _label = [l copy]; }
 - (void)endEncoding { if (_cb) { _cb->_nEnd++; _cb = nil; } }   // lets go of the command buffer, as the blit encoder does
