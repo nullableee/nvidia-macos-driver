@@ -36,7 +36,7 @@ struct IOService:OSObject {
  static IOService *copyMatchingService(OSDictionary *m){auto &v=registry[m->name];if(v.empty())return nullptr;v[0]->retain();return v[0];}
  static OSIterator *getMatchingServices(OSDictionary *m){auto *it=new OSIterator;for(auto *s:registry[m->name])it->objects.push_back(s);return it;}
 };
-static bool enabled;
+static bool enabled; static int gAgdcTargetWhy;
 static bool PE_parse_boot_argn(const char*,void *p,unsigned n){assert(n==4);*(uint32_t*)p=enabled?1:0;return enabled;}
 static const unsigned kAgdcMaxFB=4;static IOService *gAgdcFB[4];static unsigned gAgdcNFB;
 static IOService *gAgdcFBRef,*gAgdcMuxlessPCI;static char gAgdcFBMap[256];static int gAgdcScanLogged;
@@ -81,6 +81,11 @@ int main(){
  bytes=1;assert(control.vendor_doDeviceAttribute(0x980,nullptr,0,(unsigned long*)&cap,&bytes,nullptr)==kIOReturnBadArgument);
  nvdaAgdcDropFB();assert(panel.refs==1&&nvidia.refs==1&&!gAgdcNFB);
  registry["NVRMNVDAFramebuffer"]={&display};nvdaAgdcTargets(&pci,&fb);
+ assert(pci==&nvidia&&fb==&panel);nvdaAgdcDropFB();
+ registry["NVRMRenderBridge"]={};nvdaAgdcTargets(&pci,&fb);
+ assert(!pci&&!fb); // refuse a dummy NVIDIA head when the muxless broker is unavailable
+ registry["NVRMRenderBridge"]={&broker};
+ enabled=false;nvdaAgdcTargets(&pci,&fb);
  assert(pci==&nvidia&&fb==&display&&!gAgdcMuxlessPCI);nvdaAgdcScan(pci);
  assert(gAgdcNFB==1&&gAgdcFB[0]==&display);nvdaAgdcDropFB();assert(display.refs==1);
  puts("PASS: production AGDC opt-in, legacy-index refusal, missing/ambiguous broker refusal, Intel slot zero on NVIDIA renderer, exact 0x980 map, reference balance, desktop fallback");

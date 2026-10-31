@@ -39,6 +39,8 @@ run() {
     return 0
 }
 run os-version 10 sw_vers
+run boot-state 10 sysctl kern.safeboot kern.bootargs
+run boot-nvram 10 nvram boot-args
 run loaded-kexts 15 kmutil showloaded
 run bluetooth 40 system_profiler SPBluetoothDataType
 run usb 30 system_profiler SPUSBDataType

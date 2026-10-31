@@ -67,7 +67,10 @@ build_collection() {
   -S /System/Library/KernelCollections/SystemKernelExtensions.kc \
   --repository "$repository" -A "$candidate" -z > "$log" 2>&1 || { tail -30 "$log";return 1; }
  [ -s "$candidate" ] || return 1
- kmutil inspect -a x86_64 -A "$candidate" > "$log.inspect" 2>&1 || return 1
+ kmutil inspect -a x86_64 --show-kext-uuids -A "$candidate" > "$log.inspect" 2>&1 || return 1
+ if [ -n "${NEW_ACCEL_UUID:-}" ];then
+  grep -Fiq "$NEW_ACCEL_UUID" "$log.inspect" || { echo 'Candidate NVAccel UUID missing';return 1; }
+ fi
  local name
  for name in NVRM NVAccel NVRMFB NVRMAGDC NMIntelFB; do
   grep -Eq "com\.nullmoth\.$name([^A-Za-z0-9]|$)" "$log.inspect" || { echo "Missing $name from candidate KC";return 1; }

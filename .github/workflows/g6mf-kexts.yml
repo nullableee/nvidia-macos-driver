@@ -57,6 +57,7 @@ jobs:
             test_g6mf_perf \
             test_g6mf_cpu_scanout \
             test_g6mf_copy64 \
+            test_g6mf_stage_write \
             test_g6mf_compare_copy \
             test_g6mf_muxless \
             test_g6mf_probe_efi \
@@ -65,6 +66,7 @@ jobs:
             test_g6mf_metal_probe \
             test_g6mf_boot_capture \
             test_g6mf_agdc \
+            test_g6mf_agdc_discovery \
             test_g6mf_fb_start \
             test_g6mf_bridge_stage \
             test_headless_early \

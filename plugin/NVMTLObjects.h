@@ -133,6 +133,7 @@ extern id gNVMTLMainDevice;
   NSCondition *_completionCondition;
   dispatch_group_t _callbackGroup, _scheduledGroup;
   BOOL _wasScheduled, _executionDone, _completionReady, _scheduleAfterPublish;
+  uint64_t _g6CommitNS;
   NSMutableArray *_signals;
   NSMutableArray *_waits;
 }
@@ -324,3 +325,11 @@ extern unsigned nvmtl_apps1_resolve_miss, nvmtl_apps1_resolve_extra, nvmtl_apps1
 @end
 
 NSDictionary *nvmtl_index_argument_fields(NSArray *fields);
+
+@interface NVMTLTexture () { @public BOOL _g6mfPrivatePark; uint64_t _g6mfPrivateKey[12]; } @end
+int g6mf_private_image_enabled(void);
+int g6mf_private_image_take(const uint64_t key[12], nvk_image *out);
+int g6mf_private_image_put(const uint64_t key[12], nvk_image *image);
+void g6mf_private_image_flush(void);
+void g6mf_private_image_stats(uint64_t out[6]);
+void g6mf_completion_channel_stats(uint64_t out[3]);

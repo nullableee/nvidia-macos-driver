@@ -5,8 +5,8 @@
   <key>CFBundleName</key><string>NVRMAGDC</string>
   <key>CFBundleExecutable</key><string>NVRMAGDC</string>
   <key>CFBundlePackageType</key><string>KEXT</string>
-  <key>CFBundleVersion</key><string>2.6.5</string>
-  <key>CFBundleShortVersionString</key><string>2.6.5</string>
+  <key>CFBundleVersion</key><string>2.6.6</string>
+  <key>CFBundleShortVersionString</key><string>2.6.6</string>
   <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
   <key>IOKitPersonalities</key><dict>
     <key>NVDAGDCLoader</key><dict>

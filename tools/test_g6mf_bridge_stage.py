@@ -90,14 +90,15 @@ if a[0]=='create':
 else:
  for n in ('NVRM','NVAccel','NVRMFB','NVRMAGDC','NMIntelFB'):
   if not (mode=='missing-module' and n=='NMIntelFB'):print('com.nullmoth.'+n)
+ if mode!='uuid-missing':print('TEST-ACCEL-UUID')
 ''');kmutil.chmod(0o755)
- for mode in ('success','test-fail','missing-module','live-fail','pair-success','pair-live-fail','agdc-success','agdc-live-fail'):
+ for mode in ('success','test-fail','missing-module','live-fail','pair-success','pair-live-fail','agdc-success','agdc-live-fail','uuid-success','uuid-missing'):
   system=d/('install-'+mode);ext=system/'Library/Extensions';kc=system/'Library/KernelCollections/AuxiliaryKernelExtensions.kc';base=system/'Users/Shared/G6MF-Backups';kit=system/'kit'
   (ext/'NMIntelFB.kext/Contents/MacOS').mkdir(parents=True);kc.parent.mkdir();base.mkdir(parents=True);kit.mkdir()
   (ext/'NMIntelFB.kext/Contents/Info.plist').write_bytes(b'old-info');(ext/'NMIntelFB.kext/Contents/MacOS/NMIntelFB').write_bytes(b'old-fb');kc.write_bytes(b'old-kc')
   (ext/'NVAccel.kext').mkdir();(ext/'NVAccel.kext/sentinel').write_bytes(b'untouched')
   (kit/'NMIntelFB.kext/Contents/MacOS').mkdir(parents=True);(kit/'NMIntelFB.kext/Contents/MacOS/NMIntelFB').write_bytes(b'new-fb');(kit/'NMIntelFB.kext/Contents/Info.plist').write_bytes(b'new-info')
-  paired=mode.startswith(('pair-','agdc-'))
+  paired=mode.startswith(('pair-','agdc-','uuid-'))
   agdc=mode.startswith('agdc-')
   if paired:
    (ext/'NVAccel.kext/Contents/MacOS').mkdir(parents=True);(ext/'NVAccel.kext/Contents/Info.plist').write_bytes(b'old-info');(ext/'NVAccel.kext/Contents/MacOS/NVAccel').write_bytes(b'old-accel')
@@ -106,6 +107,8 @@ else:
   (kit/'plan.env').write_text('OLD_KEXT_SHA='+sha(ext/'NMIntelFB.kext/Contents/MacOS/NMIntelFB')+'\nNEW_KEXT_SHA='+sha(kit/'NMIntelFB.kext/Contents/MacOS/NMIntelFB')+'\n')
   if paired:
    with (kit/'plan.env').open('a') as f:f.write('OLD_ACCEL_SHA='+sha(ext/'NVAccel.kext/Contents/MacOS/NVAccel')+'\nNEW_ACCEL_SHA='+sha(kit/'NVAccel.kext/Contents/MacOS/NVAccel')+'\n')
+  if mode.startswith('uuid-'):
+   with (kit/'plan.env').open('a')as f:f.write('NEW_ACCEL_UUID=TEST-ACCEL-UUID\n')
   if agdc:
    for container,body in [(ext,b'old-agdc'),(kit,b'new-agdc')]:
     (container/'NVRMAGDC.kext/Contents/MacOS').mkdir(parents=True);(container/'NVRMAGDC.kext/Contents/Info.plist').write_bytes(b'info');(container/'NVRMAGDC.kext/Contents/MacOS/NVRMAGDC').write_bytes(body)
@@ -116,7 +119,7 @@ else:
    (kit/dest).write_text(code)
   manifest(kit)
   env=dict(os.environ,KMUTIL_CASE=mode.removeprefix('pair-').removeprefix('agdc-'))
-  success=mode in ('success','pair-success','agdc-success')
+  success=mode in ('success','pair-success','agdc-success','uuid-success')
   result=subprocess.run(['bash',str(kit/'install-bridge-update.sh')],env=env,text=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT)
   assert (result.returncode==0)==success,(mode,result.stdout)
   expected=b'new-fb' if success else b'old-fb'

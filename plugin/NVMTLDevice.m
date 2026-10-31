@@ -20,6 +20,8 @@
 #include <pthread.h>
 #include <stdatomic.h>
 #include <time.h>
+#include <os/log.h>
+#include "g6mf_release.h"
 #include "nvmtl_sample_positions.h"
 #include "nvmtl_log_failure.h"
 #include <sys/sysctl.h>
@@ -48,6 +50,8 @@ uint16_t nvmtl_vk_vendor(void);
 const char *nvmtl_vk_device_name(void);
 void nvmtl_vk_counts(uint64_t *bm, uint64_t *bg, uint64_t *im, uint64_t *ig, size_t *bytes);
 void nvmtl_vk_cmd_counts(uint64_t *begun, uint64_t *submitted, uint64_t *abandoned);
+void g6mf_descriptor_stats(uint64_t *out);
+void g6mf_queue_stats(uint64_t *out);
 
 static int nvmtl_sample_payload_abi(id value) {
     if (![value isKindOfClass:[NSDictionary class]]) return 0;
@@ -942,6 +946,16 @@ static BOOL nvmtl_desc_fbo(MTLTextureDescriptor *d) {
     uint32_t vkf = 0, bpp = 0; int a8 = 0;
     if (nvmtl_pixfmt(d.pixelFormat, &vkf, &bpp, &a8)) return nil;
     int wantStex = (d.usage & MTLTextureUsageShaderWrite) != 0;
+    // Prototype: exact descriptor reuse of ordinary private 2D render targets.
+    // No imported/shared/depth/multisample/heap texture enters this pool.
+    if (d.storageMode == MTLStorageModePrivate
+        && d.textureType == MTLTextureType2D && d.sampleCount == 1 && d.arrayLength == 1
+        && (d.usage & MTLTextureUsageRenderTarget)) {
+        uint64_t key[12] = {d.width, d.height, vkf, bpp, a8, d.mipmapLevelCount,
+            wantStex, d.textureType, d.arrayLength, t->_ropt, d.usage, t->_fbo};
+        memcpy(t->_g6mfPrivateKey, key, sizeof key); t->_g6mfPrivatePark = YES;
+        if (g6mf_private_image_take(key, &t->_i)) goto g6mf_private_image_ready;
+    }
     if (d.textureType == MTLTextureType2DMultisample || d.textureType == MTLTextureType2DMultisampleArray) {
         if (d.mipmapLevelCount != 1 || d.depth != 1) { nvlog("newTextureWithDescriptor: invalid multisample color descriptor"); return nil; }
         if (wantStex) { static _Atomic unsigned long msw; const unsigned long k = atomic_fetch_add(&msw, 1) + 1;
@@ -949,6 +963,7 @@ static BOOL nvmtl_desc_fbo(MTLTextureDescriptor *d) {
         if (nvmtl_vk_image_create_ms_full((uint32_t)d.width, (uint32_t)d.height, vkf, bpp, (uint32_t)d.sampleCount, (uint32_t)d.textureType, (uint32_t)d.arrayLength, &t->_i)) { nvmtl_alloc_failed("newTextureWithDescriptor"); nvlog("newTextureWithDescriptor: FAILED (multisample)"); return nil; }
     } else
     if (nvmtl_vk_image_create_typed((uint32_t)d.width, (uint32_t)d.height, vkf, bpp, a8, (uint32_t)d.mipmapLevelCount, wantStex, (uint32_t)d.textureType, nvmtl_vk_layers_for_desc((uint32_t)d.textureType, (uint32_t)d.arrayLength, (uint32_t)d.depth), &t->_i)) { nvmtl_alloc_failed("newTextureWithDescriptor"); nvlog("newTextureWithDescriptor: FAILED"); return nil; }
+g6mf_private_image_ready:
     nvmtl_alloc_ok();
     t->_q = nvmtl_device_queue();
     t->_stex = t->_i.storage != 0;
@@ -1073,7 +1088,150 @@ static int nvmtl_surface_image_create(NVMTLTexture *t, IOSurfaceRef surf, NSUInt
     return nvmtl_vk_image_create_typed(w, h, vkf, bpp, a8, 1, stex, 2u, 1u, &t->_i);
 }
 
+// Experimental live-only reuse: weak cache never extends the backing lifetime.
+// Kept opt-in until pixel/lifetime probes and WindowServer qualification pass.
+static int nvmtl_surface_reuse_mode(void) {
+    static int enabled = -1;
+    int value = __atomic_load_n(&enabled, __ATOMIC_RELAXED);
+    if (value < 0) {
+        const char *e = getenv("NVMTL_LIVE_SURFACE_REUSE");
+        value = e && (!strcmp(e, "1") || !strcmp(e, "2")) ? e[0] - '0' : 0;
+        if (!e && !strcmp(getprogname(), "WindowServer")) {
+            FILE *f = fopen("/Library/NullMoth/g6mf-live-surface-reuse", "r");
+            if (f) { int c = fgetc(f), tail = fgetc(f); value = (c == '1' || c == '2') && (tail == '\n' || tail == EOF) ? c - '0' : 0; fclose(f); }
+        }
+        __atomic_store_n(&enabled, value, __ATOMIC_RELAXED);
+    }
+    return value;
+}
+static bool nvmtl_live_surface_reuse(void) { return nvmtl_surface_reuse_mode() != 0; }
 static char nvmtl_surface_cache_key;
+static char g6mf_surface_recent_key;
+static char g6mf_surface_hold_key;
+#include "g6mf_cache_policy.h"
+enum { G6CacheEvictions, G6CacheEvictedBytes, G6CacheEntryPressure, G6CacheBytePressure,
+       G6CacheAdmissions, G6CacheTouches, G6CacheOversized, G6CachePolicyChanges, G6CacheCount };
+static _Atomic uint64_t g6mf_cache_counts[G6CacheCount];
+static _Atomic uint32_t g6mf_cache_mb = 64;
+static _Atomic uint64_t g6mf_cache_last_poll;
+static uint32_t g6mf_surface_budget_mb(void) {
+    const char *env = getenv("NVMTL_SURFACE_CACHE_MB");
+    if (env) return g6mf_cache_parse_mb(env); // Native probes set it after dlopen.
+    if (strcmp(getprogname(), "WindowServer")) return 64;
+    uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    uint64_t last = atomic_load_explicit(&g6mf_cache_last_poll, memory_order_relaxed);
+    if ((!last || now - last >= 1000000000ull) &&
+        atomic_compare_exchange_strong_explicit(&g6mf_cache_last_poll, &last, now, memory_order_relaxed, memory_order_relaxed)) {
+        char value[16] = {0};
+        FILE *f = fopen("/Library/NullMoth/g6mf-surface-cache-mb", "r");
+        if (f) { size_t n = fread(value, 1, sizeof value - 1, f); if (fgetc(f) != EOF || memchr(value, 0, n)) value[0] = 0; else value[n] = 0; fclose(f); }
+        uint32_t mb = g6mf_cache_parse_mb(value);
+        uint32_t old = atomic_exchange_explicit(&g6mf_cache_mb, mb, memory_order_relaxed);
+        if (old != mb) atomic_fetch_add_explicit(&g6mf_cache_counts[G6CachePolicyChanges], 1, memory_order_relaxed);
+    }
+    return atomic_load_explicit(&g6mf_cache_mb, memory_order_relaxed);
+}
+void g6mf_surface_cache_policy(uint64_t *mb, uint64_t *entries) {
+    uint32_t value = g6mf_surface_budget_mb();
+    if (mb) *mb = value; if (entries) *entries = g6mf_cache_max_entries(value);
+}
+void g6mf_surface_cache_stats(uint64_t *out, size_t count) {
+    if (out) for (size_t i=0; i<count && i<G6CacheCount; i++) out[i]=atomic_load_explicit(&g6mf_cache_counts[i],memory_order_relaxed);
+}
+static void g6mf_surface_evict(NSMutableArray *held, bool entryPressure, bool bytePressure) {
+    atomic_fetch_add_explicit(&g6mf_cache_counts[G6CacheEvictions],1,memory_order_relaxed);
+    atomic_fetch_add_explicit(&g6mf_cache_counts[G6CacheEvictedBytes],[held[0][@"bytes"] unsignedLongLongValue],memory_order_relaxed);
+    if (entryPressure) atomic_fetch_add_explicit(&g6mf_cache_counts[G6CacheEntryPressure],1,memory_order_relaxed);
+    if (bytePressure) atomic_fetch_add_explicit(&g6mf_cache_counts[G6CacheBytePressure],1,memory_order_relaxed);
+    [held removeObjectAtIndex:0];
+}
+// Under the device monitor. Roots retain their IOSurface, preventing ID recycling while held.
+static void g6mf_surface_hold(id device, NSArray *key, NVMTLTexture *texture) {
+    if (nvmtl_surface_reuse_mode() != 2 || !key || !texture->_vramOn || !texture->_surf) return;
+    uint32_t mb = g6mf_surface_budget_mb(), limitEntries = g6mf_cache_max_entries(mb);
+    uint64_t limitBytes = (uint64_t)mb * 1024 * 1024;
+    uint64_t bytes = MAX((uint64_t)IOSurfaceGetAllocSize(texture->_surf), (uint64_t)texture->_vramBuf.size);
+    NSMutableArray *held = objc_getAssociatedObject(device, &g6mf_surface_hold_key);
+    uint64_t total = 0;
+    for (NSDictionary *entry in held) total += [entry[@"bytes"] unsignedLongLongValue];
+    // Apply a shrinking policy even if this particular import is too large to admit.
+    while (held.count && (held.count > limitEntries || total > limitBytes)) {
+        bool entryPressure = held.count > limitEntries, bytePressure = total > limitBytes;
+        total -= [held[0][@"bytes"] unsignedLongLongValue];
+        g6mf_surface_evict(held, entryPressure, bytePressure);
+    }
+    if (!bytes || bytes > limitBytes) { atomic_fetch_add_explicit(&g6mf_cache_counts[G6CacheOversized],1,memory_order_relaxed); return; }
+    if (!held) { held = [NSMutableArray new]; objc_setAssociatedObject(device, &g6mf_surface_hold_key, held, OBJC_ASSOCIATION_RETAIN_NONATOMIC); }
+    NSUInteger old = [held indexOfObjectPassingTest:^BOOL(NSDictionary *entry, NSUInteger i, BOOL *stop) { return [entry[@"key"] isEqual:key]; }];
+    if (old != NSNotFound) { total -= [held[old][@"bytes"] unsignedLongLongValue]; [held removeObjectAtIndex:old];
+        atomic_fetch_add_explicit(&g6mf_cache_counts[G6CacheTouches],1,memory_order_relaxed);
+    } else atomic_fetch_add_explicit(&g6mf_cache_counts[G6CacheAdmissions],1,memory_order_relaxed);
+    total += bytes;
+    while (held.count && (held.count >= limitEntries || total > limitBytes)) {
+        bool entryPressure = held.count >= limitEntries, bytePressure = total > limitBytes;
+        total -= [held[0][@"bytes"] unsignedLongLongValue]; g6mf_surface_evict(held, entryPressure, bytePressure);
+    }
+    [held addObject:@{@"key":key, @"root":texture, @"bytes":@(bytes)}];
+}
+void g6mf_surface_cache_usage(id device, uint64_t *entries, uint64_t *bytes) {
+    @synchronized(device) {
+        NSArray *held = objc_getAssociatedObject(device, &g6mf_surface_hold_key);
+        uint64_t total = 0; for (NSDictionary *entry in held) total += [entry[@"bytes"] unsignedLongLongValue];
+        if (entries) *entries = held.count; if (bytes) *bytes = total;
+    }
+}
+void g6mf_surface_cache_flush(id device) {
+    @synchronized(device) { [objc_getAssociatedObject(device, &g6mf_surface_hold_key) removeAllObjects]; }
+}
+// Counts completed API calls, not frames. No texture/surface is retained here.
+// WindowServer emits one aggregate per 512 calls; probes can read all counters.
+enum { G6SurfaceCalls, G6SurfaceHitPrivate, G6SurfaceHitVram, G6SurfaceNoBacking,
+       G6SurfaceDisabled, G6SurfaceCapability, G6SurfaceViewFailed,
+       G6SurfaceCreated, G6SurfaceCreateFailed, G6SurfaceRecentMiss, G6SurfaceCount };
+static _Atomic uint64_t g6mf_surface_counts[G6SurfaceCount];
+const char *g6mf_graphics_release(void) { return G6MF_RELEASE_VERSION; }
+void g6mf_surface_stats(uint64_t *out, size_t count) {
+    if (!out) return;
+    for (size_t i = 0; i < count && i < G6SurfaceCount; ++i)
+        out[i] = atomic_load_explicit(&g6mf_surface_counts[i], memory_order_relaxed);
+}
+static void g6mf_surface_count(unsigned reason) {
+    atomic_fetch_add_explicit(&g6mf_surface_counts[reason], 1, memory_order_relaxed);
+}
+static void g6mf_surface_finished(id device) {
+    uint64_t n = atomic_fetch_add_explicit(&g6mf_surface_counts[G6SurfaceCalls], 1, memory_order_relaxed) + 1;
+    if (n % 512 || strcmp(getprogname(), "WindowServer")) return;
+    uint64_t c[G6SurfaceCount]; g6mf_surface_stats(c, G6SurfaceCount);
+    os_log_with_type(OS_LOG_DEFAULT, OS_LOG_TYPE_DEFAULT,
+        "G6MF " G6MF_RELEASE_VERSION " surfaces calls=%{public}llu private_hit=%{public}llu vram_hit=%{public}llu no_backing=%{public}llu disabled=%{public}llu capability=%{public}llu view_failed=%{public}llu created=%{public}llu create_failed=%{public}llu repeat_miss=%{public}llu",
+        (unsigned long long)c[0], (unsigned long long)c[1], (unsigned long long)c[2],
+        (unsigned long long)c[3], (unsigned long long)c[4], (unsigned long long)c[5],
+        (unsigned long long)c[6], (unsigned long long)c[7], (unsigned long long)c[8], (unsigned long long)c[9]);
+    uint64_t d[4]; g6mf_descriptor_stats(d);
+    os_log_with_type(OS_LOG_DEFAULT, OS_LOG_TYPE_DEFAULT,
+        "G6MF " G6MF_RELEASE_VERSION " descriptors sets=%{public}llu writes=%{public}llu copies=%{public}llu metadata_hits=%{public}llu",
+        (unsigned long long)d[0], (unsigned long long)d[1], (unsigned long long)d[2], (unsigned long long)d[3]);
+    uint64_t q[9]; g6mf_queue_stats(q);
+    os_log_with_type(OS_LOG_DEFAULT, OS_LOG_TYPE_DEFAULT,
+        "G6MF " G6MF_RELEASE_VERSION " queue schedule_n=%{public}llu schedule_ns=%{public}llu schedule_max_ns=%{public}llu complete_n=%{public}llu complete_ns=%{public}llu complete_max_ns=%{public}llu pending_n=%{public}llu pending_sum=%{public}llu pending_max=%{public}llu",
+        (unsigned long long)q[0], (unsigned long long)q[1], (unsigned long long)q[2],
+        (unsigned long long)q[3], (unsigned long long)q[4], (unsigned long long)q[5],
+        (unsigned long long)q[6], (unsigned long long)q[7], (unsigned long long)q[8]);
+    uint64_t cs[G6CacheCount]; g6mf_surface_cache_stats(cs, G6CacheCount);
+    uint64_t heldEntries=0,heldBytes=0; g6mf_surface_cache_usage(device,&heldEntries,&heldBytes);
+    uint32_t mb=g6mf_surface_budget_mb();
+    os_log_with_type(OS_LOG_DEFAULT,OS_LOG_TYPE_DEFAULT,
+        "G6MF " G6MF_RELEASE_VERSION " cache mb=%{public}u max_entries=%{public}u held=%{public}llu bytes=%{public}llu evictions=%{public}llu evicted_bytes=%{public}llu entry_pressure=%{public}llu byte_pressure=%{public}llu admissions=%{public}llu touches=%{public}llu oversized=%{public}llu policy_changes=%{public}llu",
+        mb,g6mf_cache_max_entries(mb),heldEntries,heldBytes,cs[0],cs[1],cs[2],cs[3],cs[4],cs[5],cs[6],cs[7]);
+    uint64_t pc[6]; g6mf_private_image_stats(pc);
+    os_log_with_type(OS_LOG_DEFAULT,OS_LOG_TYPE_DEFAULT,
+        "G6MF " G6MF_RELEASE_VERSION " private_images enabled=%{public}d hits=%{public}llu misses=%{public}llu puts=%{public}llu evictions=%{public}llu held=%{public}llu bytes=%{public}llu",
+        g6mf_private_image_enabled(),pc[0],pc[1],pc[2],pc[3],pc[4],pc[5]);
+    uint64_t channel[3]; g6mf_completion_channel_stats(channel);
+    os_log_with_type(OS_LOG_DEFAULT,OS_LOG_TYPE_DEFAULT,
+        "G6MF " G6MF_RELEASE_VERSION " completion_channel ready=%{public}llu calls=%{public}llu errors=%{public}llu",
+        channel[0],channel[1],channel[2]);
+}
 - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)d iosurface:(IOSurfaceRef)surf plane:(NSUInteger)plane {
     @synchronized(self) {
         NSMapTable *cache = objc_getAssociatedObject(self, &nvmtl_surface_cache_key);
@@ -1087,28 +1245,48 @@ static char nvmtl_surface_cache_key;
     size_t w = d.width, h = d.height;
     if (!w || !h || w > UINT32_MAX || h > UINT32_MAX) return nil;
     if (surf && plane >= MAX((size_t)1, IOSurfaceGetPlaneCount(surf))) return nil;
-    NVMTLTexture *t = [NVMTLTexture new];
-    t->_ropt = (MTLResourceOptions)d.cpuCacheMode | ((MTLResourceOptions)d.hazardTrackingMode << MTLResourceHazardTrackingModeShift)
+    const MTLResourceOptions ropt = (MTLResourceOptions)d.cpuCacheMode | ((MTLResourceOptions)d.hazardTrackingMode << MTLResourceHazardTrackingModeShift)
              | ((MTLResourceOptions)d.storageMode << MTLResourceStorageModeShift);
-    t->_fbo = nvmtl_desc_fbo(d);
+    const BOOL fbo = nvmtl_desc_fbo(d);
     uint32_t vkf = 0, bpp = 0; int a8 = 0;
     if (nvmtl_pixfmt(d.pixelFormat, &vkf, &bpp, &a8)) return nil;
     int wantStex = (d.usage & MTLTextureUsageShaderWrite) != 0;
-    NSArray *key = surf ? @[@(IOSurfaceGetID(surf)), @(plane), @(w), @(h), @(d.pixelFormat), @(t->_ropt), @(t->_fbo)] : nil;
+    NSArray *key = surf ? @[@(IOSurfaceGetID(surf)), @(plane), @(w), @(h), @(d.pixelFormat), @(ropt), @(fbo)] : nil;
     NVMTLTexture *backing = key ? [cache objectForKey:key] : nil;
+    if (!backing) {
+        g6mf_surface_count(G6SurfaceNoBacking);
+        if (key) {
+            // Keep descriptor keys only, never a surface or an import. IDs may
+            // be recycled, so a repeat is a hint rather than identity proof.
+            NSMutableOrderedSet *recent = objc_getAssociatedObject(self, &g6mf_surface_recent_key);
+            if (!recent) { recent = [NSMutableOrderedSet new]; objc_setAssociatedObject(self, &g6mf_surface_recent_key, recent, OBJC_ASSOCIATION_RETAIN_NONATOMIC); }
+            if ([recent containsObject:key]) { g6mf_surface_count(G6SurfaceRecentMiss); [recent removeObject:key]; }
+            else if (recent.count >= 128) [recent removeObjectAtIndex:0];
+            [recent addObject:key];
+        }
+    }
+    else if (backing->_vramOn && !nvmtl_live_surface_reuse()) g6mf_surface_count(G6SurfaceDisabled);
+    else if (backing->_vramOn && wantStex && !backing->_stex) g6mf_surface_count(G6SurfaceCapability);
     // Failed BAR imports use a private image. Repeated wrappers of the same
     // surface must share that image, just as successful family imports do,
     // whether a wrapper reads it or writes it (the image is made writable).
     // Weak entries do not pin the image after the application's last wrapper.
-    if (backing && !backing->_vramOn) {
+    if (backing && (!backing->_vramOn || (nvmtl_live_surface_reuse() && (!wantStex || backing->_stex)))) {
         NVMTLTexture *alias = (NVMTLTexture *)[backing newTextureViewWithPixelFormat:d.pixelFormat];
         if (alias) {
-            alias->_viewParent = nil; alias->_usage = d.usage; alias->_ropt = t->_ropt; alias->_fbo = t->_fbo;
+            g6mf_surface_count(backing->_vramOn ? G6SurfaceHitVram : G6SurfaceHitPrivate);
+            alias->_viewParent = nil; alias->_usage = d.usage; alias->_ropt = ropt; alias->_fbo = fbo;
             nvmtl_texture_desc_swizzle(alias, d);
+            g6mf_surface_hold(self, key, backing);
+            g6mf_surface_finished(self);
             return alias;
         }
+        g6mf_surface_count(G6SurfaceViewFailed);
     }
+    NVMTLTexture *t = [NVMTLTexture new];
+    t->_ropt = ropt; t->_fbo = fbo;
     if (nvmtl_surface_image_create(t, surf, plane, (uint32_t)w, (uint32_t)h, vkf, bpp, a8, wantStex)) {
+        g6mf_surface_count(G6SurfaceCreateFailed); g6mf_surface_finished(self);
         nvlog("newTextureWithDescriptor:iosurface:plane: image create FAILED (%zux%zu)", w, h); return nil; }
     t->_q = nvmtl_device_queue();
     t->_surf = surf; if (surf) { CFRetain(surf); t->_surfOwned = YES; t->_clientWritten = nvmtl_busy_foreign(surf, plane) != 0; }
@@ -1117,7 +1295,9 @@ static char nvmtl_surface_cache_key;
     t->_stex = t->_i.storage != 0;
     t->_usage = d.usage;
     nvmtl_texture_desc_swizzle(t, d);
-    if (key && !t->_vramOn) [cache setObject:t forKey:key];
+    if (key && (!t->_vramOn || nvmtl_live_surface_reuse())) [cache setObject:t forKey:key];
+    g6mf_surface_hold(self, key, t);
+    g6mf_surface_count(G6SurfaceCreated); g6mf_surface_finished(self);
     nvlog("newTextureWithDescriptor:iosurface:%p plane:%lu -> %p (%zux%zu fmt %lu)",
           (void *)surf, (unsigned long)plane, (__bridge void *)t, w, h, (unsigned long)d.pixelFormat);
     return t; }
@@ -2260,4 +2440,5 @@ static void nvmtl_log_compute_descriptor(MTLComputePipelineDescriptor *d) {
 #import "NVMTLEmbedded.m"
 #import "NVMTLVendorCompiler.m"
 #include "nvmtl_vk.c"
+#include "g6mf_private_image_cache.h"
 #import "NVMTLSass.m"

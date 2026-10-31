@@ -27,7 +27,7 @@ if not args.probe_only:components += [
  ('NVAccel','kexts/NVRM/accel/nvrm-accel.cpp','kexts/NVRM/accel/Info.plist',includes+['-DNM_TAHOE','-Ikexts/NVRM','-Ikexts/NVRM/accel','-Ikexts/NVRM/accel/iofam','-Ikexts/NVRM/accel/re']),
  ('NVRMAGDC','kexts/NVRMAGDC/nvrm-agdc.cpp','kexts/NVRMAGDC/Info.plist',['-Ikexts/NVRMAGDC']),
  ('NVRMFB','kexts/NVRMFB/fb/nvrm-fb.cpp','kexts/NVRMFB/fb/Info.plist',includes+['-Ikexts/NVRMFB','-Ikexts/NVRMFB/fb'])]
-manifest={'base':subprocess.check_output(['git','rev-parse','HEAD'],cwd=R,text=True).strip(),'patch':'g6mf-copy-v8','host':platform.platform(),'binaries':{},'commands':[],'hardware_validated':False,'native_kmutil_validated':False,'backend_dtor_switch':feature.returncode==0}
+manifest={'release':'0.4.4','base':subprocess.check_output(['git','rev-parse','HEAD'],cwd=R,text=True).strip(),'patch':'g6mf-graphics-0.4.4','host':platform.platform(),'binaries':{},'commands':[],'hardware_validated':False,'native_kmutil_validated':False,'backend_dtor_switch':feature.returncode==0}
 def run(cmd,log):
  manifest['commands'].append(cmd)
  p=subprocess.run(cmd,cwd=R,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True)

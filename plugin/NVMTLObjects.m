@@ -1184,6 +1184,7 @@ void nvmtl_texture_desc_swizzle(NVMTLTexture *t, MTLTextureDescriptor *d) {
     if (_swzView) nvmtl_vk_image_view_destroy(_swzView);
     if (!_parent && _parkable && _subHeap && _i.img) nvmtl_heap_park(_subHeap, &_i, _pkey, _heapOffset, _pkLen);
     if (!_parent && _bparkable && _backBuf && _i.img) nvmtl_bpark_put(_backBuf, &_i, _pkey);
+    if (!_parent && _g6mfPrivatePark && _i.img) g6mf_private_image_put(_g6mfPrivateKey, &_i);
     if (!_parent) nvmtl_vk_image_destroy(&_i);
     if (_stTwin.img) nvmtl_vk_image_destroy(&_stTwin);
     if (!_parent && _vramOn) { nvmtl_vk_buffer_destroy(&_vramBuf); _vramOn = NO; }
@@ -1288,22 +1289,29 @@ static bool nvmtl_surfout_import(void) {
 // right after checking that the seed has not moved (a CPU write, or a newer commit marked it again): a mark that waited
 // for the lock could land after a CPU write that came in meanwhile and make the older VRAM current over it. 50 tries,
 // 2 ms apart; the texture then follows the seed the mark left.
+static void nvmtl_surface_remark_attempt(NVMTLTexture *r, uint32_t seed, unsigned attempt, dispatch_queue_t queue) {
+    if (IOSurfaceGetSeed(r->_surf) != seed) return;
+    const int marked = nvmtl_vk_surface_dirty_try((uint32_t)IOSurfaceGetID(r->_surf), (uint32_t)r->_plane);
+    if (marked > 0 && attempt < 49) {
+        // Yield the serial queue between attempts: a contended surface must not
+        // postpone unrelated ready surfaces behind up to 98 ms of sleeps.
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2000000ll), queue, ^{
+            nvmtl_surface_remark_attempt(r, seed, attempt + 1, queue);
+        });
+        return;
+    }
+    if (marked) return;
+    @synchronized (nvmtl_surface_sync(r)) {
+        if (r->_surfSeed != seed) return;
+        const uint32_t now = IOSurfaceGetSeed(r->_surf);
+        r->_surfSeed = now; r->_surfGen = nvmtl_vram_tag_bump(r->_surf, r->_plane, now);
+    }
+}
 static void nvmtl_surface_remark_later(NVMTLTexture *r, uint32_t seed) {
     static dispatch_queue_t queue; static dispatch_once_t once;
     dispatch_once(&once, ^{ queue = dispatch_queue_create("nvmtl.surface-remark", DISPATCH_QUEUE_SERIAL); });
     dispatch_async(queue, ^{
-        int marked = 1;
-        for (int i = 0; i < 50 && marked > 0; i++) {
-            if (i) usleep(2000);
-            if (IOSurfaceGetSeed(r->_surf) != seed) return;
-            marked = nvmtl_vk_surface_dirty_try((uint32_t)IOSurfaceGetID(r->_surf), (uint32_t)r->_plane);
-        }
-        if (marked) return;
-        @synchronized (nvmtl_surface_sync(r)) {
-            if (r->_surfSeed != seed) return;
-            const uint32_t now = IOSurfaceGetSeed(r->_surf);
-            r->_surfSeed = now; r->_surfGen = nvmtl_vram_tag_bump(r->_surf, r->_plane, now);
-        }
+        nvmtl_surface_remark_attempt(r, seed, 0, queue);
     });
 }
 // dirtied: the commit already marked this surface's shared VRAM newest in the kernel (WindowServer, with an accelerator

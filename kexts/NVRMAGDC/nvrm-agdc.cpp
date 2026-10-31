@@ -15,7 +15,7 @@
 #define FBLOG(fmt, ...) IOLog("NVRM-agdc: " fmt "\n", ##__VA_ARGS__)
 #include <mach/kmod.h>
 extern "C" kern_return_t _start(kmod_info_t *ki, void *d); extern "C" kern_return_t _stop(kmod_info_t *ki, void *d);
-extern "C" { KMOD_EXPLICIT_DECL(com.nullmoth.NVRMAGDC, "2.6.5", _start, _stop) }
+extern "C" { KMOD_EXPLICIT_DECL(com.nullmoth.NVRMAGDC, "2.6.6", _start, _stop) }
 extern "C" kern_return_t _start(kmod_info_t *ki, void *d) { return KERN_SUCCESS; }
 extern "C" kern_return_t _stop(kmod_info_t *ki, void *d)  { return KERN_SUCCESS; }
 #include "AppleGraphicsDeviceControl_re.h"
@@ -176,6 +176,7 @@ static IOService *nvdaPciAncestor(IOService *service)
     for (unsigned i = 0; p && !p->metaCast("IOPCIDevice") && i < 8; ++i) p = p->getProvider();
     return p && p->metaCast("IOPCIDevice") ? p : nullptr;
 }
+static int gAgdcTargetWhy; // 0 success, 1 panel absent, 2 index invalid, 3 broker absent/ambiguous
 static bool nvdaAgdcMuxlessTargets(IOService **pci, IOService **fb)
 {
     uint32_t enabled = 0;
@@ -183,9 +184,9 @@ static bool nvdaAgdcMuxlessTargets(IOService **pci, IOService **fb)
     OSDictionary *match = IOService::serviceMatching("NMIntelFB");
     IOService *panel = match ? IOService::copyMatchingService(match) : nullptr;
     OSSafeReleaseNULL(match);
-    if (!panel) return false;
+    if (!panel) { gAgdcTargetWhy = 1; return false; }
     OSNumber *index = OSDynamicCast(OSNumber, panel->getProperty("IOFBDependentIndex"));
-    if (!index || index->unsigned32BitValue() != 0) { panel->release(); return false; }
+    if (!index || index->unsigned32BitValue() != 0) { gAgdcTargetWhy = 2; panel->release(); return false; }
     match = IOService::serviceMatching("NVRMRenderBridge");
     OSIterator *it = match ? IOService::getMatchingServices(match) : nullptr;
     OSSafeReleaseNULL(match);
@@ -200,7 +201,8 @@ static bool nvdaAgdcMuxlessTargets(IOService **pci, IOService **fb)
     }
     if (renderPCI && count == 1) renderPCI->retain();
     OSSafeReleaseNULL(it);
-    if (!renderPCI || count != 1) { panel->release(); return false; }
+    if (!renderPCI || count != 1) { gAgdcTargetWhy = 3; panel->release(); return false; }
+    gAgdcTargetWhy = 0;
     gAgdcMuxlessPCI = renderPCI; gAgdcFBRef = panel;
     *pci = renderPCI; *fb = panel;
     FBLOG("muxless: AGDC render PCI %s, Intel framebuffer %s", renderPCI->getName(), panel->getName());
@@ -209,6 +211,11 @@ static bool nvdaAgdcMuxlessTargets(IOService **pci, IOService **fb)
 static void nvdaAgdcTargets(IOService **pci, IOService **fb)
 {
     *pci = nullptr; *fb = nullptr;
+    uint32_t muxless = 0;
+    if (PE_parse_boot_argn("nmoptimus", &muxless, sizeof muxless) && muxless == 1) {
+        nvdaAgdcMuxlessTargets(pci, fb);
+        return; // opt-in muxless must never select a dummy NVIDIA display head
+    }
     OSDictionary *m = IOService::serviceMatching("NVRMNVDAFramebuffer"); if (!m) return;
     IOService *f = IOService::copyMatchingService(m); m->release();
     if (!f) { nvdaAgdcMuxlessTargets(pci, fb); return; }
@@ -266,6 +273,7 @@ static void nvdaAgdcScan(IOService *pci)
 }
 
 static SInt32 gAgdcBusy = 0;
+#include "nv_agdc_discovery.h"
 static void nvdaAgdcWorkBody(void);
 static void nvdaAgdcWork(thread_call_param_t, thread_call_param_t)
 {
@@ -274,8 +282,16 @@ static void nvdaAgdcWork(thread_call_param_t, thread_call_param_t)
 static void nvdaAgdcWorkBody(void)
 {
     if (gAgdcWant == 1 && !gAgdc) {
-        IOService *pci = nullptr, *fb = nullptr; nvdaAgdcTargets(&pci, &fb);
-        if (!pci || !fb) { gAgdcState = -1; FBLOG("AGDC: no PCI device or no framebuffer yet (pci %p fb %p)", pci, fb); return; }
+        IOService *pci = nullptr, *fb = nullptr;
+        const bool found = nvAgdcAwaitTargets(
+            []() { return gAgdcWant == 1; },
+            [&]() { nvdaAgdcTargets(&pci, &fb); return pci && fb; },
+            []() { IOSleep(100); });
+        if (!found) {
+            gAgdcState = gAgdcWant == 1 ? -1 : 0;
+            FBLOG("AGDC: target discovery stopped (state %d reason %d)", gAgdcState, gAgdcTargetWhy);
+            return;
+        }
         nvdaAgdcScan(pci);
         NVDADeviceControl *d = OSTypeAlloc(NVDADeviceControl);
         if (!d) { gAgdcState = -2; FBLOG("AGDC: alloc failed"); nvdaAgdcDropFB(); return; }
@@ -302,6 +318,7 @@ static int nvrmfb_agdc_sysctl SYSCTL_HANDLER_ARGS
     if (err || !req->newptr) return err;
     if (v != 0 && v != 1) return EINVAL;
     gAgdcWant = v;
+    if (v == 1 && !gAgdc) gAgdcState = 0; // pending: clear an earlier discovery failure before polling
     if (!gAgdcCall) gAgdcCall = thread_call_allocate(nvdaAgdcWork, nullptr);
     if (!gAgdcCall) return ENOMEM;
     thread_call_enter(gAgdcCall); return 0;

@@ -117,7 +117,7 @@ extern "C" kern_return_t _start(kmod_info_t *ki, void *d); extern "C" kern_retur
 #ifdef NMX_ACCEL
 extern "C" { KMOD_EXPLICIT_DECL(com.nullmoth.NMXAccel, "0.1", _start, _stop) }
 #else
-extern "C" { KMOD_EXPLICIT_DECL(com.nullmoth.NVAccel, "0.1.4", _start, _stop) }
+extern "C" { KMOD_EXPLICIT_DECL(com.nullmoth.NVAccel, "0.1.8", _start, _stop) }
 #endif
 extern "C" kern_return_t _start(kmod_info_t *ki, void *d) { return KERN_SUCCESS; }
 extern "C" kern_return_t _stop(kmod_info_t *ki, void *d)  { return KERN_SUCCESS; }
@@ -1280,6 +1280,11 @@ static int    gNvIop = 0;
 static SInt64 gCntIopOk, gCntIopFail, gCntIopEmpty, gCntIopSrcRes, gCntIopSrcSurf, gCntIopBlank;
 static SInt64 gCntIopEnter, gCntIopValidate;
 static NMPerfMetric gPerfEntry, gPerfFence, gPerfReady, gPerfCopy, gPerfTotal;
+static int gNvLatencyDiag;
+SYSCTL_INT(_debug, OID_AUTO, nvaccel_latency_diag, CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_KERN,
+           &gNvLatencyDiag, 0, "1 = opt-in pageoff/lock timings after desktop startup; default 0");
+static bool nvLatencyDiag() { return __atomic_load_n(&gNvLatencyDiag, __ATOMIC_RELAXED) == 1; }
+static NMPerfMetric gPerf_po_total, gPerf_po_gpu, gPerf_po_prepare, gPerf_po_stagewait, gPerf_po_ce, gPerf_po_write, gPerf_po_complete, gPerf_dirty_lock, gPerf_copy_hold;
 static uint64_t gPerfLastEntry;
 static SInt64 gPerfBins[6];
 static SInt64 gCntIopOkHead[kNvMaxFB];
@@ -1341,9 +1346,20 @@ static bool nvAccelIopFlip(IOService *fb, unsigned head, IOSurface *s, void *pip
 static bool nvSurfWaitReady(unsigned int id);
 static void nvAccelIopHome(IOService *fb, unsigned head);
 // Default to the measured v6/v7 algorithm until the explicit A/B test enables it.
+static int gNvStageMapCopy;
+static SInt64 gStageMapOk, gStageMapFallback, gCopyLockMiss, gCopyPageoffFail;
+SYSCTL_INT(_debug, OID_AUTO, nvaccel_stage_map_copy, CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_KERN,
+           &gNvStageMapCopy, 0, "1 = experimental mapped staging-to-IOSurface copy (fallback to writeBytes)");
 static int gNvMuxlessCopy64;
 SYSCTL_INT(_debug, OID_AUTO, nvaccel_muxless_copy64, CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_KERN,
            &gNvMuxlessCopy64, 0, "1 = experimental aligned 64-bit Intel scanout copy; otherwise original 32-bit copy");
+// Experimental path is off at every boot; only the bounded A/B script enables it.
+static int gNvDirectPresent;
+static SInt64 gDirectAttempts, gDirectOK, gDirectFallback, gDirectHeld, gDirectTimeout;
+static NMPerfMetric gPerfDirectTotal, gPerfDirectCE;
+static int nvAccelMuxlessDirect(NVAccel *, IOService *, IOSurface *, unsigned);
+SYSCTL_INT(_debug, OID_AUTO, nvaccel_direct_present, CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_KERN,
+           &gNvDirectPresent, 0, "1 = experimental muxless staging-to-Intel present; default 0");
 IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
 {
     OSAddAtomic64(1, &gCntIopEnter);
@@ -1406,6 +1422,16 @@ IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
         const bool gpuReady = nvSurfWaitReady(s->getSurfaceID());
         if (perfIntel) nmPerfAdd(gPerfFence, nmPerfElapsed(fenceStart));
         if (muxless && !gpuReady) return kIOReturnSuccess; // retain the last completed frame
+        if (muxless && __atomic_load_n(&gNvDirectPresent, __ATOMIC_RELAXED) == 1) {
+            const int direct = nvAccelMuxlessDirect(a, fb, s, head);
+            if (direct) {
+                if (direct > 0) {
+                    OSAddAtomic64(1, &gCntIopSrcSurf); OSAddAtomic64(1, &gCntIopOk);
+                    OSAddAtomic64(1, &gCntIopOkHead[head]);
+                }
+                return kIOReturnSuccess;
+            }
+        }
         uint64_t readyStart = perfIntel ? mach_absolute_time() : 0;
         const bool copyReady = nvAccelSurfCopyReady(s, head);
         if (perfIntel) nmPerfAdd(gPerfReady, nmPerfElapsed(readyStart));
@@ -1562,6 +1588,37 @@ NVACCEL_CNT(nvaccel_iop_src_res,      gCntIopSrcRes,      "K3: frames sourced fr
 NVACCEL_CNT(nvaccel_iop_src_surf,     gCntIopSrcSurf,     "K3: frames sourced from the IOSurface memory");
 NVACCEL_CNT(nvaccel_iop_blank,        gCntIopBlank,       "K6: frames copied whose 64 samples were all ONE colour (a blank frame)");
 static SInt64 gCntIopCopySkip;
+NVACCEL_CNT(nvaccel_diag_po_total_count, gPerf_po_total.count, "v11 po_total count; elapsed ns, overlapping intervals");
+NVACCEL_CNT(nvaccel_diag_po_total_ns, gPerf_po_total.ns, "v11 po_total ns; elapsed ns, overlapping intervals");
+NVACCEL_CNT(nvaccel_diag_po_total_max, gPerf_po_total.max, "v11 po_total max; elapsed ns, overlapping intervals");
+NVACCEL_CNT(nvaccel_diag_po_gpu_count, gPerf_po_gpu.count, "v11 po_gpu count; elapsed ns, overlapping intervals");
+NVACCEL_CNT(nvaccel_diag_po_gpu_ns, gPerf_po_gpu.ns, "v11 po_gpu ns; elapsed ns, overlapping intervals");
+NVACCEL_CNT(nvaccel_diag_po_gpu_max, gPerf_po_gpu.max, "v11 po_gpu max; elapsed ns, overlapping intervals");
+NVACCEL_CNT(nvaccel_diag_po_prepare_count, gPerf_po_prepare.count, "v11 po_prepare count; elapsed ns, overlapping intervals");
+NVACCEL_CNT(nvaccel_diag_po_prepare_ns, gPerf_po_prepare.ns, "v11 po_prepare ns; elapsed ns, overlapping intervals");
+NVACCEL_CNT(nvaccel_diag_po_prepare_max, gPerf_po_prepare.max, "v11 po_prepare max; elapsed ns, overlapping intervals");
+NVACCEL_CNT(nvaccel_diag_po_stagewait_count, gPerf_po_stagewait.count, "v11 po_stagewait count; elapsed ns, overlapping intervals");
+NVACCEL_CNT(nvaccel_diag_po_stagewait_ns, gPerf_po_stagewait.ns, "v11 po_stagewait ns; elapsed ns, overlapping intervals");
+NVACCEL_CNT(nvaccel_diag_po_stagewait_max, gPerf_po_stagewait.max, "v11 po_stagewait max; elapsed ns, overlapping intervals");
+NVACCEL_CNT(nvaccel_diag_po_ce_count, gPerf_po_ce.count, "v11 po_ce count; elapsed ns, overlapping intervals");
+NVACCEL_CNT(nvaccel_diag_po_ce_ns, gPerf_po_ce.ns, "v11 po_ce ns; elapsed ns, overlapping intervals");
+NVACCEL_CNT(nvaccel_diag_po_ce_max, gPerf_po_ce.max, "v11 po_ce max; elapsed ns, overlapping intervals");
+NVACCEL_CNT(nvaccel_diag_po_write_count, gPerf_po_write.count, "v11 po_write count; elapsed ns, overlapping intervals");
+NVACCEL_CNT(nvaccel_diag_po_write_ns, gPerf_po_write.ns, "v11 po_write ns; elapsed ns, overlapping intervals");
+NVACCEL_CNT(nvaccel_diag_po_write_max, gPerf_po_write.max, "v11 po_write max; elapsed ns, overlapping intervals");
+NVACCEL_CNT(nvaccel_diag_po_complete_count, gPerf_po_complete.count, "v11 po_complete count; elapsed ns, overlapping intervals");
+NVACCEL_CNT(nvaccel_diag_po_complete_ns, gPerf_po_complete.ns, "v11 po_complete ns; elapsed ns, overlapping intervals");
+NVACCEL_CNT(nvaccel_diag_po_complete_max, gPerf_po_complete.max, "v11 po_complete max; elapsed ns, overlapping intervals");
+NVACCEL_CNT(nvaccel_diag_dirty_lock_count, gPerf_dirty_lock.count, "v11 dirty_lock count; elapsed ns, overlapping intervals");
+NVACCEL_CNT(nvaccel_diag_dirty_lock_ns, gPerf_dirty_lock.ns, "v11 dirty_lock ns; elapsed ns, overlapping intervals");
+NVACCEL_CNT(nvaccel_diag_dirty_lock_max, gPerf_dirty_lock.max, "v11 dirty_lock max; elapsed ns, overlapping intervals");
+NVACCEL_CNT(nvaccel_diag_copy_hold_count, gPerf_copy_hold.count, "v11 copy_hold count; elapsed ns, overlapping intervals");
+NVACCEL_CNT(nvaccel_diag_copy_hold_ns, gPerf_copy_hold.ns, "v11 copy_hold ns; elapsed ns, overlapping intervals");
+NVACCEL_CNT(nvaccel_diag_copy_hold_max, gPerf_copy_hold.max, "v11 copy_hold max; elapsed ns, overlapping intervals");
+NVACCEL_CNT(nvaccel_stage_map_ok, gStageMapOk, "mapped staging copies completed");
+NVACCEL_CNT(nvaccel_stage_map_fallback, gStageMapFallback, "mapping unavailable, original writeBytes used");
+NVACCEL_CNT(nvaccel_copy_lock_miss, gCopyLockMiss, "copy readiness exhausted accelerator try-lock retries");
+NVACCEL_CNT(nvaccel_copy_pageoff_fail, gCopyPageoffFail, "pageoff did not establish fresh system memory");
 NVACCEL_CNT(nvaccel_iop_copy_skip,    gCntIopCopySkip,    "frames kept on the panel because the surface's newest pixels were not yet in system memory");
 static int    gIopFlip = 0;
 static SInt64 gCntIopFlip, gCntIopFlipHome, gCntIopFlipNo[8];
@@ -1572,6 +1629,17 @@ NVACCEL_CNT(nvaccel_iop_flip_lock,    gCntIopFlipNo[3],   "copied because the ac
 NVACCEL_CNT(nvaccel_iop_flip_novram,  gCntIopFlipNo[4],   "copied because the surface has no RM VRAM");
 NVACCEL_CNT(nvaccel_iop_flip_stale,   gCntIopFlipNo[5],   "copied because system memory holds the newest copy");
 NVACCEL_CNT(nvaccel_iop_flip_refused, gCntIopFlipNo[7],   "copied because the framebuffer refused the flip");
+NVACCEL_CNT(nvaccel_direct_attempts, gDirectAttempts, "direct present attempts");
+NVACCEL_CNT(nvaccel_direct_ok, gDirectOK, "direct present ok");
+NVACCEL_CNT(nvaccel_direct_fallback, gDirectFallback, "direct present fallback");
+NVACCEL_CNT(nvaccel_direct_held, gDirectHeld, "direct present held");
+NVACCEL_CNT(nvaccel_direct_timeout, gDirectTimeout, "direct present timeout");
+NVACCEL_CNT(nvaccel_direct_total_count, gPerfDirectTotal.count, "direct present total count; ns units");
+NVACCEL_CNT(nvaccel_direct_total_ns, gPerfDirectTotal.ns, "direct present total ns; ns units");
+NVACCEL_CNT(nvaccel_direct_total_max, gPerfDirectTotal.max, "direct present total max; ns units");
+NVACCEL_CNT(nvaccel_direct_ce_count, gPerfDirectCE.count, "direct present ce count; ns units");
+NVACCEL_CNT(nvaccel_direct_ce_ns, gPerfDirectCE.ns, "direct present ce ns; ns units");
+NVACCEL_CNT(nvaccel_direct_ce_max, gPerfDirectCE.max, "direct present ce max; ns units");
 static SInt64 gCntIopUnwritten, gCntIopCopyUnwritten;
 NVACCEL_CNT(nvaccel_iop_flip_unwritten, gCntIopUnwritten,     "copied because the family marked VRAM newest on a copy the plugin never wrote");
 NVACCEL_CNT(nvaccel_iop_copy_unwritten, gCntIopCopyUnwritten, "copied frames that skipped the page-off because the plugin never wrote the VRAM copy");
@@ -1705,6 +1773,19 @@ static void nvaccelInstallSysctl(void)
     sysctl_register_oid(&sysctl__debug_nvaccel_map_free);
     sysctl_register_oid(&sysctl__debug_nvaccel_iop);
     sysctl_register_oid(&sysctl__debug_nvaccel_muxless_copy64);
+    sysctl_register_oid(&sysctl__debug_nvaccel_direct_present);
+    sysctl_register_oid(&sysctl__debug_nvaccel_direct_attempts);
+    sysctl_register_oid(&sysctl__debug_nvaccel_direct_ok);
+    sysctl_register_oid(&sysctl__debug_nvaccel_direct_fallback);
+    sysctl_register_oid(&sysctl__debug_nvaccel_direct_held);
+    sysctl_register_oid(&sysctl__debug_nvaccel_direct_timeout);
+    sysctl_register_oid(&sysctl__debug_nvaccel_direct_total_count);
+    sysctl_register_oid(&sysctl__debug_nvaccel_direct_total_ns);
+    sysctl_register_oid(&sysctl__debug_nvaccel_direct_total_max);
+    sysctl_register_oid(&sysctl__debug_nvaccel_direct_ce_count);
+    sysctl_register_oid(&sysctl__debug_nvaccel_direct_ce_ns);
+    sysctl_register_oid(&sysctl__debug_nvaccel_direct_ce_max);
+
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_ok);         sysctl_register_oid(&sysctl__debug_nvaccel_iop_fail);
     sysctl_register_oid(&sysctl__debug_nvaccel_perf_entry_count);
     sysctl_register_oid(&sysctl__debug_nvaccel_perf_entry_ns);
@@ -1730,6 +1811,39 @@ static void nvaccelInstallSysctl(void)
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_enter);      sysctl_register_oid(&sysctl__debug_nvaccel_iop_validate);
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_empty);
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_src_res);    sysctl_register_oid(&sysctl__debug_nvaccel_iop_src_surf);
+    sysctl_register_oid(&sysctl__debug_nvaccel_latency_diag);
+    sysctl_register_oid(&sysctl__debug_nvaccel_diag_po_total_count);
+    sysctl_register_oid(&sysctl__debug_nvaccel_diag_po_total_ns);
+    sysctl_register_oid(&sysctl__debug_nvaccel_diag_po_total_max);
+    sysctl_register_oid(&sysctl__debug_nvaccel_diag_po_gpu_count);
+    sysctl_register_oid(&sysctl__debug_nvaccel_diag_po_gpu_ns);
+    sysctl_register_oid(&sysctl__debug_nvaccel_diag_po_gpu_max);
+    sysctl_register_oid(&sysctl__debug_nvaccel_diag_po_prepare_count);
+    sysctl_register_oid(&sysctl__debug_nvaccel_diag_po_prepare_ns);
+    sysctl_register_oid(&sysctl__debug_nvaccel_diag_po_prepare_max);
+    sysctl_register_oid(&sysctl__debug_nvaccel_diag_po_stagewait_count);
+    sysctl_register_oid(&sysctl__debug_nvaccel_diag_po_stagewait_ns);
+    sysctl_register_oid(&sysctl__debug_nvaccel_diag_po_stagewait_max);
+    sysctl_register_oid(&sysctl__debug_nvaccel_diag_po_ce_count);
+    sysctl_register_oid(&sysctl__debug_nvaccel_diag_po_ce_ns);
+    sysctl_register_oid(&sysctl__debug_nvaccel_diag_po_ce_max);
+    sysctl_register_oid(&sysctl__debug_nvaccel_diag_po_write_count);
+    sysctl_register_oid(&sysctl__debug_nvaccel_diag_po_write_ns);
+    sysctl_register_oid(&sysctl__debug_nvaccel_diag_po_write_max);
+    sysctl_register_oid(&sysctl__debug_nvaccel_diag_po_complete_count);
+    sysctl_register_oid(&sysctl__debug_nvaccel_diag_po_complete_ns);
+    sysctl_register_oid(&sysctl__debug_nvaccel_diag_po_complete_max);
+    sysctl_register_oid(&sysctl__debug_nvaccel_diag_dirty_lock_count);
+    sysctl_register_oid(&sysctl__debug_nvaccel_diag_dirty_lock_ns);
+    sysctl_register_oid(&sysctl__debug_nvaccel_diag_dirty_lock_max);
+    sysctl_register_oid(&sysctl__debug_nvaccel_diag_copy_hold_count);
+    sysctl_register_oid(&sysctl__debug_nvaccel_diag_copy_hold_ns);
+    sysctl_register_oid(&sysctl__debug_nvaccel_diag_copy_hold_max);
+    sysctl_register_oid(&sysctl__debug_nvaccel_stage_map_copy);
+    sysctl_register_oid(&sysctl__debug_nvaccel_stage_map_ok);
+    sysctl_register_oid(&sysctl__debug_nvaccel_stage_map_fallback);
+    sysctl_register_oid(&sysctl__debug_nvaccel_copy_lock_miss);
+    sysctl_register_oid(&sysctl__debug_nvaccel_copy_pageoff_fail);
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_blank);      sysctl_register_oid(&sysctl__debug_nvaccel_iop_copy_skip);
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_flip);       sysctl_register_oid(&sysctl__debug_nvaccel_iop_flips);
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_flip_home);  sysctl_register_oid(&sysctl__debug_nvaccel_iop_flip_lock);
@@ -1979,7 +2093,12 @@ static IOReturn nvAccelSurfVram(struct NVRMSurfShareEsc *p, task_t task, unsigne
     }
     void *surf = _ZN13IOSurfaceRoot13lookupSurfaceEjP4task(gNVSVRoot, p->surfaceID, task);
     if (!surf) { p->status = NVRM_SS_NO_SURFACE; gNVSVRefused++; return kIOReturnSuccess; }
-    if (!nvFamLock(a, tryOnly)) { ((OSObject *)surf)->release(); p->status = tryOnly ? NVRM_SS_BUSY : NVRM_SS_OFF; return kIOReturnSuccess; }
+    bool familyLocked;
+    {
+        NMPerfScope timing(nvLatencyDiag() && cmd == NVRM_ESC_SURF_DIRTY && !tryOnly ? &gPerf_dirty_lock : nullptr);
+        familyLocked = nvFamLock(a, tryOnly);
+    }
+    if (!familyLocked) { ((OSObject *)surf)->release(); p->status = tryOnly ? NVRM_SS_BUSY : NVRM_SS_OFF; return kIOReturnSuccess; }
     void *cache = _ZN22IOGraphicsAccelerator223deviceCacheForIOSurfaceEP9IOSurfacej((void *)a, surf, p->plane);
     OSObject *ctx = cache ? *(OSObject *volatile *)((unsigned char *)cache + 0x20) : nullptr;
     NVResource *res = OSDynamicCast(NVResource, ctx);
@@ -2054,6 +2173,14 @@ static IOBufferMemoryDescriptor *nvSVStage(unsigned long long len)
     return b;
 }
 
+// Called only after successful CE completion, while the descriptor is prepared
+// and the global staging lock is held. Never retain a writable mapping beyond
+// this copy or change the source surface's validity on a mapping failure.
+#include "nv_stage_write.h"
+
+// Requires helpers above and the same family -> staging lock order as pageoff.
+#include "nv_direct_present.h"
+
 void NVResource::pageoff(IOAccelEvent *ev, bool a1, bool *out, unsigned long long a3)
 {
     volatile unsigned char *r = (volatile unsigned char *)this;
@@ -2072,9 +2199,14 @@ void NVResource::pageoff(IOAccelEvent *ev, bool a1, bool *out, unsigned long lon
     }
     // a CPU lock that arrives while WindowServer's GPU is still writing this surface waits for that write first, as a
     // normal IOSurfaceLock does on Apple's drivers (the commit marked it pending; see nvmtl_ws_mark_pending)
-    nvSurfWaitReady(_ZNK9IOSurface12getSurfaceIDEv(surf));
+    NMPerfScope totalTiming(nvLatencyDiag() ? &gPerf_po_total : nullptr);
+    { NMPerfScope timing(nvLatencyDiag() ? &gPerf_po_gpu : nullptr);
+      nvSurfWaitReady(_ZNK9IOSurface12getSurfaceIDEv(surf)); }
     IOMemoryDescriptor *md = (IOMemoryDescriptor *)_ZNK9IOSurface19getMemoryDescriptorEv(surf);
-    if (!md || md->prepare(kIODirectionNone) != kIOReturnSuccess) {
+    IOReturn prepareResult;
+    { NMPerfScope timing(nvLatencyDiag() ? &gPerf_po_prepare : nullptr);
+      prepareResult = md ? md->prepare(kIODirectionNone) : kIOReturnNoMemory; }
+    if (!md || prepareResult != kIOReturnSuccess) {
         gNVSVPageoffFail++;
         ALOG("surfvram pageoff: res %p surface pages could not be wired (md %p) -- family pageoff instead", this, md);
         IOAccelResource2::pageoff(ev, a1, out, a3);
@@ -2087,7 +2219,7 @@ void NVResource::pageoff(IOAccelEvent *ev, bool a1, bool *out, unsigned long lon
     bool ok = false; unsigned st = NVRM_SS_OFF; unsigned long long usec = 0, cpuUs = 0;
     bool staged = false;
     if (IOLock *lk = nvSVStageLock()) {
-        IOLockLock(lk);
+        { NMPerfScope timing(nvLatencyDiag() ? &gPerf_po_stagewait : nullptr); IOLockLock(lk); }
         IOBufferMemoryDescriptor *sb = nvSVStage(len);
         IOByteCount sl = 0;
         addr64_t sp = sb ? sb->getPhysicalSegment(0, &sl, kIOMemoryMapperNone) : 0;
@@ -2099,12 +2231,16 @@ void NVResource::pageoff(IOAccelEvent *ev, bool a1, bool *out, unsigned long lon
             q.pages = spa; q.pageCount = pages; q.length = len;
             IOService *nvrm = nvAccelNVRM();
             const OSSymbol *sym = OSSymbol::withCStringNoCopy(NVRM_SS_FN_PAGEOFF);
-            if (nvrm && sym) nvrm->callPlatformFunction(sym, false, &q, nullptr, nullptr, nullptr);
+            { NMPerfScope timing(nvLatencyDiag() ? &gPerf_po_ce : nullptr);
+              if (nvrm && sym) nvrm->callPlatformFunction(sym, false, &q, nullptr, nullptr, nullptr); }
             if (sym) sym->release();
             st = q.status; usec = q.usec;
             if (st == 0) {
                 const uint64_t t0 = mach_absolute_time();
-                const IOByteCount w = md->writeBytes(0, sb->getBytesNoCopy(), (IOByteCount)len);
+                IOByteCount w;
+                { NMPerfScope timing(nvLatencyDiag() ? &gPerf_po_write : nullptr);
+                  w = nvStageWrite(md, sb->getBytesNoCopy(), (IOByteCount)len,
+                                                  __atomic_load_n(&gNvStageMapCopy, __ATOMIC_RELAXED) == 1); }
                 cpuUs = (mach_absolute_time() - t0) / 1000;
                 ok = (w == (IOByteCount)len);
                 if (!ok) st = NVRM_SS_TOO_SMALL;
@@ -2133,14 +2269,15 @@ void NVResource::pageoff(IOAccelEvent *ev, bool a1, bool *out, unsigned long lon
             q.pages = pa; q.pageCount = pages; q.length = len;
             IOService *nvrm = nvAccelNVRM();
             const OSSymbol *sym = OSSymbol::withCStringNoCopy(NVRM_SS_FN_PAGEOFF);
-            if (nvrm && sym) nvrm->callPlatformFunction(sym, false, &q, nullptr, nullptr, nullptr);
+            { NMPerfScope timing(nvLatencyDiag() ? &gPerf_po_ce : nullptr);
+              if (nvrm && sym) nvrm->callPlatformFunction(sym, false, &q, nullptr, nullptr, nullptr); }
             if (sym) sym->release();
             st = q.status; usec = q.usec; ok = st == 0;
             if (st == 0x65u) mayUnwire = false;
         }
         IOFree(pa, pages * sizeof *pa);
     }
-    if (mayUnwire) md->complete(kIODirectionNone);
+    if (mayUnwire) { NMPerfScope timing(nvLatencyDiag() ? &gPerf_po_complete : nullptr); md->complete(kIODirectionNone); }
     else ALOG("surfvram pageoff: res %p CE copy TIMED OUT -- surface pages stay wired (%llu B)", this, len);
     if (ok) {
         nvSVPend(_ZNK9IOSurface12getSurfaceIDEv(surf), 0);
@@ -2441,8 +2578,8 @@ static void nvAccelSurfScanoutSync(IOSurface *s)
 }
 // True when the surface's system memory holds its newest pixels, after moving them there if the GPU drew them into VRAM.
 // Unlike nvAccelSurfScanoutSync it waits a few ms for the accelerator lock and does not clear the pending mark when the
-// page-off fails. At most 4 frames in a row are held back per head: a surface that never syncs is copied as before
-// rather than freezing the panel.
+// page-off fails. Muxless scanout never copies unconfirmed pixels. The legacy
+// non-muxless path retains its existing four-frame fallback.
 static unsigned gIopCopyHeld[kNvMaxFB];
 static bool nvAccelSurfCopyReady(IOSurface *s, unsigned head)
 {
@@ -2454,17 +2591,19 @@ static bool nvAccelSurfCopyReady(IOSurface *s, unsigned head)
         bool locked = false;
         for (unsigned i = 0; i < 8 && !(locked = nvFamLock(a, true)); i++) IOSleep(1);
         if (locked) {
+            NMPerfScope holdTiming(nvLatencyDiag() ? &gPerf_copy_hold : nullptr);
             void *cache = _ZN22IOGraphicsAccelerator223deviceCacheForIOSurfaceEP9IOSurfacej((void *)a, (void *)s, 0);
             OSObject *ctx = cache ? *(OSObject *volatile *)((unsigned char *)cache + 0x20) : nullptr;
             NVResource *res = OSDynamicCast(NVResource, ctx);
             volatile unsigned short *valid = res ? *(unsigned short *volatile *)((volatile unsigned char *)res + 0x30) : nullptr;
             if (!res || !valid || (valid[0] & 1u)) ready = true;
             else if (!nvAccelIopCopyNeedsPageoff(false, nvAccelResPluginWrote(res))) { ready = true; OSAddAtomic64(1, &gCntIopCopyUnwritten); }
-            else { bool out = false; res->pageoff(nullptr, true, &out, 0); ready = out || (valid[0] & 1u); }
+            else { bool out = false; res->pageoff(nullptr, true, &out, 0); ready = out || (valid[0] & 1u);
+                if (!ready) OSAddAtomic64(1, &gCopyPageoffFail); }
             if (ready) nvSVPend(id, 0);
             if (cache) ((OSObject *)cache)->release();
             nvFamUnlock(a);
-        }
+        } else OSAddAtomic64(1, &gCopyLockMiss);
     }
     if (head >= kNvMaxFB) return true;
     if (ready) { gIopCopyHeld[head] = 0; return true; }

@@ -4,6 +4,28 @@
  * SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
  */
 
+// Observation only: keep scheduling, capacity and completion ordering unchanged.
+static uint64_t g6mf_queue_metrics[9]; // schedule n/ns/max, completion n/ns/max, pending n/sum/max
+static BOOL g6mf_queue_timing_on(void) {
+    static int enabled = -1;
+    int value = __atomic_load_n(&enabled, __ATOMIC_RELAXED);
+    if (value < 0) {
+        const char *e = getenv("G6MF_TEST_QUEUE_STATS");
+        value = e ? !strcmp(e, "1") : (getprogname() && !strcmp(getprogname(), "WindowServer"));
+        __atomic_store_n(&enabled, value, __ATOMIC_RELAXED);
+    }
+    return value != 0;
+}
+static void g6mf_queue_observe(unsigned base, uint64_t value) {
+    __atomic_fetch_add(&g6mf_queue_metrics[base], 1, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&g6mf_queue_metrics[base + 1], value, __ATOMIC_RELAXED);
+    uint64_t previous = __atomic_load_n(&g6mf_queue_metrics[base + 2], __ATOMIC_RELAXED);
+    while (previous < value && !__atomic_compare_exchange_n(&g6mf_queue_metrics[base + 2], &previous, value, 1, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {}
+}
+void g6mf_queue_stats(uint64_t *out) {
+    if (!out) return;
+    for (unsigned i = 0; i < 9; ++i) out[i] = __atomic_load_n(&g6mf_queue_metrics[i], __ATOMIC_RELAXED);
+}
 @interface NVMTLQueueReservation : NSObject { @public __weak NVMTLCommandBuffer *buffer; } @end
 @implementation NVMTLQueueReservation @end
 @interface NVMTLSubmissionPart : NSObject {
@@ -447,6 +469,7 @@ static int nvmtl_skip_empty_on(void) {
     if (_scheduleAfterPublish) return;
     [_completionCondition lock];
     if (!_wasScheduled) {
+        if (_g6CommitNS) g6mf_queue_observe(0, clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - _g6CommitNS);
         _wasScheduled = YES; _cbstatus = MTLCommandBufferStatusScheduled;
         NSArray *handlers = [_scheduledHandlers copy]; [_scheduledHandlers removeAllObjects];
         [self nvmtlDispatchHandlers:handlers scheduled:YES];
@@ -508,6 +531,7 @@ static int nvmtl_skip_empty_on(void) {
 }
 - (void)nvmtlFinishCallbacks {
     [_completionCondition lock];
+    if (_g6CommitNS) { g6mf_queue_observe(3, clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - _g6CommitNS); _g6CommitNS = 0; }
     NSArray *handlers = [_handlers copy]; [_handlers removeAllObjects];
     [self nvmtlDispatchHandlers:handlers scheduled:NO];
     _completionReady = YES;
@@ -738,6 +762,7 @@ static void nvmtl_gsub_ahead_pass1(void) {
 - (void)nvmtlSubmitWithEvents {
     @synchronized ([NVMTLCommandBuffer class]) {
         if (_committed) return;
+        if (g6mf_queue_timing_on()) _g6CommitNS = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
         [self nvmtlReserveQueue];
         _committed = YES; _commitMarking = YES;
         if (!__atomic_load_n(&_rep, __ATOMIC_ACQUIRE)) __atomic_store_n(&_rep, nvmtl_ep_enter(), __ATOMIC_RELEASE);
@@ -754,6 +779,7 @@ static void nvmtl_gsub_ahead_pass1(void) {
         nvmtl_busy_mark_commit(self);
         if (!nvmtl_pending_buffers) nvmtl_pending_buffers = [NSMutableArray new];
         [nvmtl_pending_buffers addObject:self];
+        if (_g6CommitNS) g6mf_queue_observe(6, nvmtl_pending_buffers.count);
         nvmtl_pump_buffers();
     }
 }

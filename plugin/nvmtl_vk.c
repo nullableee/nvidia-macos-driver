@@ -2020,11 +2020,12 @@ int nvmtl_vk_surface_dirty(uint32_t surfaceID, uint32_t plane) { return nvmtl_vk
 /* the same mark, given up instead of waiting when the accelerator lock is taken (NVRM_SS_PLANE_TRYLOCK; only an NVAccel
    that publishes NVAccelSurfaceWait is asked): 0 marked, 1 the lock was taken, -1 refused */
 int nvmtl_vk_surface_dirty_try(uint32_t surfaceID, uint32_t plane) { return nvmtl_vk_surface_mark_newest(surfaceID, plane, 0x40000000u); }
-// WindowServer completion mark (NVAccel nvSurfGpuEscape), on NVK's surface escape: 0 = the kernel took it
+#include "g6mf_completion_channel.h"
+// WindowServer completion marks use a dedicated client, independent of dirty ioctls.
 uint32_t nvmtl_vk_surface_gpu_mark(uint32_t surfaceID, int pending)
 {
     if (!pnvk_surface_dirty || !g_dev) return 0x80000002u;
-    return pnvk_surface_dirty(g_dev, surfaceID, 0x80000000u | (pending ? 1u : 0u));
+    return g6mf_completion_mark(surfaceID, pending);
 }
 /* 1 when NVAccel publishes NVAccelSurfaceWait: its page-off waits for a surface WindowServer's GPU is still writing */
 int nvmtl_vk_accel_surface_wait(void)
@@ -2146,7 +2147,7 @@ static int nvmtl_spirv_bmask(const void *p, size_t n, uint64_t out[4])
 {
     const uint32_t *w = (const uint32_t *)p; size_t nw = n / 4;
     memset(out, 0, 4 * sizeof *out);
-    if (!p || nw < 5 || w[0] != 0x07230203u) return 0;
+    if (!p || n % 4 || nw < 5 || w[0] != 0x07230203u) return 0;
     // the bindless texture heap (set 2, bound once per command buffer) has bindings of its own: its binding 0 is not
     // the stage's buffer 0, and counting it put every textured draw on the slow descriptor path
     const uint32_t bound = w[3];
@@ -2155,14 +2156,22 @@ static int nvmtl_spirv_bmask(const void *p, size_t n, uint64_t out[4])
     for (size_t i = 5; i < nw; ) {
         uint32_t wc = w[i] >> 16, op = w[i] & 0xffffu;
         if (!wc || i + wc > nw) { free(heap); return 0; }
-        if (op == 71 && wc == 4 && w[i + 2] == 34 && w[i + 3] == 2 && w[i + 1] < bound) heap[w[i + 1]] = 1;
+        if (op == 71 && wc == 4 && w[i + 2] == 34 && w[i + 1] < bound) {
+            if (w[i + 3] == 2) heap[w[i + 1]] = 1;
+            else if (w[i + 3] == 3) heap[w[i + 1]] = 2;
+        }
         i += wc;
     }
     int ok = 1;
     for (size_t i = 5; i < nw; ) {
         uint32_t wc = w[i] >> 16, op = w[i] & 0xffffu;
-        if (op == 71 && wc == 4 && w[i + 2] == 33 && !(w[i + 1] < bound && heap[w[i + 1]])) {
+        if (op == 71 && wc == 4 && w[i + 2] == 33 && !(w[i + 1] < bound && heap[w[i + 1]] == 1)) {
             uint32_t b = w[i + 3];
+            // Framebuffer input attachments belong to set 3, bound separately from this stage's
+            // resources. Treating color(0..7) as an unknown stage binding invalidated both graphics
+            // masks and made Core Animation rewrite almost the entire resource layout per draw.
+            // Ignore only this supported band in that set; unknown stage bindings still fail closed.
+            if (w[i + 1] < bound && heap[w[i + 1]] == 2 && b >= 192 && b < 192 + NVMTL_NCOL) { i += wc; continue; }
             if (b == NVMTL_ADDRESS_BINDING_NUMBER) out[NVMTL_ADDRESS_BINDING >> 6] |= 1ull << (NVMTL_ADDRESS_BINDING & 63);
             else if (b < NVMTL_ADDRESS_BINDING) out[b >> 6] |= 1ull << (b & 63);
             else if (b != NVMTL_GL_UNIFORM_BINDING && !(b >= NVMTL_STEX_BINDING_NUMBER && b < NVMTL_STEX_BINDING_NUMBER + NVMTL_NSTEX)) { ok = 0; break; }
@@ -2939,9 +2948,15 @@ static int nvmtl_address_snapshot(nvk_cmdbuf *c, uint32_t which, VkDescriptorBuf
     }
     uint64_t *addresses = (uint64_t *)((uint8_t *)page->buffer.map + slot * NVMTL_TABLE_BYTES);
     nvmtl_bindtable *t = c->table;
+    uint64_t dummyAddress = 0;
+    int haveDummyAddress = 0;
     for (unsigned i = 0; i < NVMTL_NBUF; ++i) {
         nvmtl_slot *s = t ? &t->s[which][i] : NULL;
-        addresses[i] = s && s->kind == NVMTL_SLOT_BUF ? s->address + s->off : nvmtl_vk_buffer_address(&g_dummyBuf);
+        if (s && s->kind == NVMTL_SLOT_BUF) addresses[i] = s->address + s->off;
+        else {
+            if (!haveDummyAddress) { dummyAddress = nvmtl_vk_buffer_address(&g_dummyBuf); haveDummyAddress = 1; }
+            addresses[i] = dummyAddress;
+        }
     }
     uint64_t self = nvmtl_vk_buffer_address(&page->buffer);
     if (!self) nvlog("address table: page has no device address - array_ref<void> arguments will read 0");
@@ -3020,6 +3035,25 @@ static VkDescriptorSet nvmtl_snapshot_set_md(nvk_cmdbuf *c, uint32_t which, uint
 static VkDescriptorSet nvmtl_snapshot_set_m(nvk_cmdbuf *c, uint32_t which, uint32_t stex_hi, const uint64_t *mask, const uint64_t *tb)
 { return nvmtl_snapshot_set_md(c, which, stex_hi, mask, tb, VK_NULL_HANDLE, NULL, NULL); }
 #define NVMTL_COPY_HAS(m, i) ((m) && (((m)[(i) >> 6] >> ((i) & 63)) & 1))
+#include "nvmtl_descriptor_reuse.h"
+static uint64_t g6mf_metadata_sets, g6mf_metadata_copies, g6mf_metadata_hits;
+void g6mf_descriptor_stats(uint64_t *out) {
+    if (!out) return;
+    out[0] = __atomic_load_n(&g6mf_metadata_sets, __ATOMIC_RELAXED);
+    out[1] = __atomic_load_n(&g_e78c[E78C_WRITES], __ATOMIC_RELAXED);
+    out[2] = __atomic_load_n(&g6mf_metadata_copies, __ATOMIC_RELAXED);
+    out[3] = __atomic_load_n(&g6mf_metadata_hits, __ATOMIC_RELAXED);
+}
+static int nvmtl_metadata_reuse_on(void) {
+    static int enabled = -1;
+    int value = __atomic_load_n(&enabled, __ATOMIC_RELAXED);
+    if (value < 0) {
+        const char *e = getenv("NVMTL_METADATA_REUSE");
+        value = e ? !strcmp(e, "1") : (getprogname() && !strcmp(getprogname(), "WindowServer"));
+        __atomic_store_n(&enabled, value, __ATOMIC_RELAXED);
+    }
+    return value;
+}
 static VkDescriptorSet nvmtl_snapshot_set_md(nvk_cmdbuf *c, uint32_t which, uint32_t stex_hi, const uint64_t *mask, const uint64_t *tb,
                                              VkDescriptorSet from, const uint64_t *copym, const VkDescriptorBufferInfo *uniform)
 {
@@ -3173,6 +3207,8 @@ static VkDescriptorSet nvmtl_snapshot_set_md(nvk_cmdbuf *c, uint32_t which, uint
         w[nw++] = (VkWriteDescriptorSet){ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, set,
             NVMTL_GL_UNIFORM_BINDING, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, NULL, uniform, NULL };
     nvmtl_enc78_count(E78C_WRITES, nw);
+    __atomic_fetch_add(&g6mf_metadata_sets, 1, __ATOMIC_RELAXED);
+    if (ncp) __atomic_fetch_add(&g6mf_metadata_copies, ncp, __ATOMIC_RELAXED);
     pvkUpdateDescriptorSets(g_dev, nw, w, ncp, cp);
     return set;
 }
@@ -3221,8 +3257,12 @@ static VkDescriptorSet nvmtl_snapshot_set_c(nvk_cmdbuf *c, uint32_t which, const
     // what changed is the table. On the same table page that is a new dynamic offset, not a new set.
     const int was = sametb && t->last[which] && t->dirty[which] && t->last_idx[which] < c->nsets
                     && (VkDescriptorSet)c->sets[t->last_idx[which]].set == t->last[which];
-    if (was && nvmtl_table_ubo() && hi <= t->last_hi[which] && !(pm[0] & 0xffffffffull)
-        && !(t->chg[which][0] >> 32) && !t->chg[which][1] && !t->chg[which][2] && !t->chg[which][3]) {
+    const int buffersOnly = !(t->chg[which][0] >> 32) && !t->chg[which][1] && !t->chg[which][2] && !t->chg[which][3];
+    const int buffersReusable = buffersOnly && !(pm[0] & 0xffffffffull);
+    const int metadataOnly = nvmtl_metadata_reuse_on()
+        && nvmtl_metadata_descriptors_unchanged(hi, t->chg[which], pm);
+    if (was && nvmtl_table_ubo() && hi <= t->last_hi[which]
+        && (buffersReusable || metadataOnly)) {
         int covered = 1;
         for (int k = 0; k < 4; k++) if (pm[k] & ~t->lastw[which][k]) covered = 0;
         const int table = NVMTL_E78_HAS(pm, NVMTL_ADDRESS_BINDING);
@@ -3235,6 +3275,7 @@ static VkDescriptorSet nvmtl_snapshot_set_c(nvk_cmdbuf *c, uint32_t which, const
             t->dirty[which] = 0; memset(t->chg[which], 0, sizeof t->chg[which]);
             c->dyn_out[which] = t->lastdyn[which]; c->tab_out[which] = t->lasttab[which];
             nvmtl_enc78_count(E78C_SETREUSE, 1);
+            if (metadataOnly && !buffersReusable) __atomic_fetch_add(&g6mf_metadata_hits, 1, __ATOMIC_RELAXED);
             return t->last[which];
         }
     }
