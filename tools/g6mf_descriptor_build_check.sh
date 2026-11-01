@@ -32,11 +32,18 @@ if [[ -z "$HEADER_ROOT" ]]; then
     echo "No compilation or system changes attempted." >&2
     exit 2
 fi
-OUT="$HOME/Desktop/G6MF-descriptor-compile-$(date +%Y%m%d-%H%M%S)-$$"
+# Diagnostic builds preserve nvlog() messages in a process-private file supplied
+# by the smoke harness. Release behavior remains the default.
+MODE="release"
+if [[ "${G6MF_DIAGNOSTIC:-0}" == "1" ]]; then MODE="diagnostic"; fi
+OUT="$HOME/Desktop/G6MF-descriptor-compile-$(date +%Y%m%d-%H%M%S)-$"
 mkdir -p "$OUT"
 echo "Repository revision: $(git -C "$ROOT" rev-parse --short HEAD)" | tee "$OUT/info.txt"
 echo "Vulkan headers: $HEADER_ROOT" | tee -a "$OUT/info.txt"
 echo "Build output: $OUT" | tee -a "$OUT/info.txt"
+echo "Build mode: $MODE" | tee -a "$OUT/info.txt"
+BUILD_DEFINE="-DNVMTL_RELEASE=1"
+if [[ "$MODE" == "diagnostic" ]]; then BUILD_DEFINE="-DNVMTL_RELEASE=0"; fi
 python3 "$ROOT/tools/test_g6mf_descriptor_audit.py" > "$OUT/audit-test.txt" 2>&1 || {
     cat "$OUT/audit-test.txt"; echo "STOP: audit test failed"; exit 3;
 }
@@ -45,7 +52,7 @@ python3 "$ROOT/tools/test_g6mf_descriptor_reuse.py" > "$OUT/reuse-test.txt" 2>&1
 }
 cd "$ROOT/plugin"
 if ! xcrun clang -arch x86_64 -mmacosx-version-min=15.0 -bundle \
-   -fobjc-arc -O1 -DNVMTL_RELEASE=1 -Wno-protocol \
+   -fobjc-arc -O1 "$BUILD_DEFINE" -Wno-protocol \
    -Wno-incomplete-implementation -Werror=unguarded-availability-new \
    -I"$HEADER_ROOT" \
    -o "$OUT/NVMTLDriver" NVMTLDevice.m \

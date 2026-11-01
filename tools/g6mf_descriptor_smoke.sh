@@ -31,6 +31,13 @@ mkdir -p "$OUT"
 echo "Candidate: $DRIVER" | tee "$OUT/summary.txt"
 shasum -a 256 "$DRIVER" | tee -a "$OUT/summary.txt"
 echo "Writing logs under: $OUT" | tee -a "$OUT/summary.txt"
+XLATE="/Library/GPUBundles/nvmtl/libnvmtl_translate.dylib"
+if [[ -f "$XLATE" && -r "$XLATE" ]]; then
+    echo "Translator present: $XLATE" | tee -a "$OUT/summary.txt"
+    file "$XLATE" | tee -a "$OUT/summary.txt"
+else
+    echo "WARNING: translator absent or unreadable at $XLATE" | tee -a "$OUT/summary.txt"
+fi
 xcrun clang -arch x86_64 -mmacosx-version-min=15.0 -fobjc-arc -O1 \
     -o "$OUT/descriptor-render-probe" "$ROOT/tools/g6mf_descriptor_render_probe.m" \
     -framework Foundation -framework Metal -framework IOKit \
@@ -41,13 +48,19 @@ run_case() {
     local name="$1"
     shift
     echo "START $name" | tee -a "$OUT/summary.txt"
-    if env G6MF_DESC_AUDIT=1 "$@" "$OUT/descriptor-render-probe" "$DRIVER" 1 >"$OUT/$name.log" 2>&1; then
+    if env G6MF_DESC_AUDIT=1 NVMTL_LOG_PATH="$OUT/$name.driver.log" "$@" "$OUT/descriptor-render-probe" "$DRIVER" 1 >"$OUT/$name.log" 2>&1; then
         grep -E 'RENDER PASS|DESC_AUDIT' "$OUT/$name.log" | tee -a "$OUT/summary.txt" || true
         echo "PASS $name" | tee -a "$OUT/summary.txt"
     else
         local rc=$?
         echo "FAIL $name rc=$rc (see $OUT/$name.log); aborting remaining tests." | tee -a "$OUT/summary.txt"
         tail -25 "$OUT/$name.log" >&2
+        if [[ -s "$OUT/$name.driver.log" ]]; then
+            echo "--- NVMTL detailed log (last 70 lines) ---" >&2
+            tail -70 "$OUT/$name.driver.log" >&2
+        else
+            echo "NOTE: no detailed NVMTL log. Rebuild with G6MF_DIAGNOSTIC=1." >&2
+        fi
         exit "$rc"
     fi
 }
