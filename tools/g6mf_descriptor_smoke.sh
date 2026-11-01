@@ -23,7 +23,7 @@ fi
 if [[ "$(git -C "$ROOT" branch --show-current)" != "experiment/sequoia-descriptor-perf" ]]; then
     echo "STOP: use experiment/sequoia-descriptor-perf" >&2; exit 2
 fi
-if ! nm -gj "$DRIVER" | grep -q '_g6mf_descriptor_audit_stats'; then
+if ! nm -gj "$DRIVER" | grep -F '_g6mf_descriptor_audit_stats' >/dev/null; then
     echo "STOP: build is older than the audit snapshot API. Rebuild it first." >&2; exit 2
 fi
 OUT="$HOME/Desktop/G6MF-descriptor-smoke-$(date +%Y%m%d-%H%M%S)-$$"

@@ -43,7 +43,7 @@ int main(int argc,char **argv){@autoreleasepool{
  for(unsigned i=0;i<2048;i++){unsigned offset=(mask&&(i&1))||(churn&&i%3==2)?120:160;float expected=201+((i&1)?2:0)+((churn||mask)?2*offset:0);if(fetch&&live)expected+=0.25f;if(read[i]!=expected){fprintf(stderr,"PIXEL %u got%f expected%f\n",i,read[i],expected);return 5;}}
  stats(after);if(getenv("G6MF_EXPECT_NO_METADATA"))assert(after[3]==before[3]);else if(!strcmp(argv[2],"1")&&!mask)assert(after[3]>before[3]);if(!strcmp(argv[2],"0"))assert(after[3]==before[3]);printf("RENDER PASS mode=%s draws=2048 encode_ms=%.3f sets=%llu writes=%llu copies=%llu fast_cases=%llu\n",argv[2],encode,after[0]-before[0],after[1]-before[1],after[2]-before[2],after[3]-before[3]);if (auditStats) {
    auditStats(auditAfter,13);
-   printf("DESC_AUDIT events=%llu exact=%llu table=%llu noopt=%llu no_last=%llu layout=%llu stale=%llu storage=%llu mask=%llu changed=%llu other=%llu batch_hit=%llu batch_miss=%llu\\n",
+   printf("DESC_AUDIT events=%llu exact=%llu table=%llu noopt=%llu no_last=%llu layout=%llu stale=%llu storage=%llu mask=%llu changed=%llu other=%llu batch_hit=%llu batch_miss=%llu\n",
       (unsigned long long)(auditAfter[0]-auditBefore[0]), (unsigned long long)(auditAfter[1]-auditBefore[1]),
       (unsigned long long)(auditAfter[2]-auditBefore[2]), (unsigned long long)(auditAfter[3]-auditBefore[3]),
       (unsigned long long)(auditAfter[4]-auditBefore[4]), (unsigned long long)(auditAfter[5]-auditBefore[5]),
