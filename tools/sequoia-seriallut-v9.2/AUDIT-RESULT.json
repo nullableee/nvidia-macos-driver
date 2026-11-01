@@ -1,0 +1,16 @@
+{
+  "status": "PASS",
+  "static_checks": {
+    "macos_build": "24H232",
+    "uuid": "37573E08-0E1B-3981-988C-0AFBCA6C9AA7",
+    "text_sha256": "942e14ede3f404499171471997480d364fbafb74577c414beaf2fa8fd76395d6",
+    "text_vmaddr": "0x7ff80404c000",
+    "dispatch_call": "0x7ff8041121ff",
+    "dispatch_stub": "0x7ff8041411f2",
+    "dispatch_slot": "0x7ff840053938",
+    "dispatch_return": "0x7ff804112204",
+    "lut_block_invoke": "0x7ff80411293c"
+  },
+  "method": "CoreDisplay __TEXT from user-provided archive; no binaries embedded",
+  "native_install_tested": false
+}
