@@ -9,6 +9,8 @@
 #include <mach-o/nlist.h>
 #include <mach/mach.h>
 #include <unistd.h>
+#include <fcntl.h>
+#include <syslog.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -3036,6 +3038,7 @@ static VkDescriptorSet nvmtl_snapshot_set_m(nvk_cmdbuf *c, uint32_t which, uint3
 { return nvmtl_snapshot_set_md(c, which, stex_hi, mask, tb, VK_NULL_HANDLE, NULL, NULL); }
 #define NVMTL_COPY_HAS(m, i) ((m) && (((m)[(i) >> 6] >> ((i) & 63)) & 1))
 #include "nvmtl_descriptor_reuse.h"
+#include "nvmtl_descriptor_audit.h"
 static uint64_t g6mf_metadata_sets, g6mf_metadata_copies, g6mf_metadata_hits;
 void g6mf_descriptor_stats(uint64_t *out) {
     if (!out) return;
@@ -3044,6 +3047,58 @@ void g6mf_descriptor_stats(uint64_t *out) {
     out[2] = __atomic_load_n(&g6mf_metadata_copies, __ATOMIC_RELAXED);
     out[3] = __atomic_load_n(&g6mf_metadata_hits, __ATOMIC_RELAXED);
 }
+/* Optional, read-only WindowServer miss diagnostics. No cache/binding behavior changes.
+ * Enable only with G6MF_DESC_AUDIT=1 in a test process, or a root-owned
+ * /Library/NullMoth/g6mf-descriptor-audit containing exactly "1\n".
+ * Never print per draw. All counters are process-local and approximate under races. */
+static _Atomic uint64_t g6mf_da[G6MF_DA_N];
+static _Atomic uint64_t g6mf_da_events;
+static int g6mf_desc_audit_enabled(void)
+{
+    static _Atomic int cached = -1;
+    int value = atomic_load_explicit(&cached, memory_order_relaxed);
+    if (value != -1) return value;
+    const char *e = getenv("G6MF_DESC_AUDIT");
+    int enabled = e && !strcmp(e, "1");
+    if (!enabled && getprogname() && !strcmp(getprogname(), "WindowServer")) {
+        const char *path = "/Library/NullMoth/g6mf-descriptor-audit";
+        int fd = open(path, O_RDONLY | O_NOFOLLOW);
+        if (fd >= 0) {
+            struct stat st;
+            if (fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_uid == 0
+                && !(st.st_mode & 022) && st.st_size > 0 && st.st_size <= 2) {
+                char flag[3] = {0};
+                ssize_t len = read(fd, flag, sizeof flag);
+                enabled = (len == 1 && flag[0] == '1')
+                       || (len == 2 && flag[0] == '1' && flag[1] == '\n');
+            }
+            close(fd);
+        }
+    }
+    int expected = -1;
+    atomic_compare_exchange_strong_explicit(&cached, &expected, enabled, memory_order_relaxed, memory_order_relaxed);
+    return atomic_load_explicit(&cached, memory_order_relaxed);
+}
+static void g6mf_desc_audit_event(enum g6mf_desc_audit_reason reason)
+{
+    if (!g6mf_desc_audit_enabled()) return;
+    atomic_fetch_add_explicit(&g6mf_da[reason], 1, memory_order_relaxed);
+    const uint64_t n = atomic_fetch_add_explicit(&g6mf_da_events, 1, memory_order_relaxed) + 1;
+    if (n & 65535u) return;
+    uint64_t v[G6MF_DA_N];
+    for (unsigned i = 0; i < G6MF_DA_N; i++)
+        v[i] = atomic_load_explicit(&g6mf_da[i], memory_order_relaxed);
+    syslog(LOG_NOTICE, "G6MF-DESC-AUDIT: events=%llu exact=%llu table=%llu noopt=%llu no_last=%llu "
+           "layout=%llu stale=%llu storage=%llu mask=%llu changed=%llu other=%llu batch_hit=%llu batch_miss=%llu",
+           (unsigned long long)n, (unsigned long long)v[G6MF_DA_REUSE_EXACT],
+           (unsigned long long)v[G6MF_DA_REUSE_TABLE], (unsigned long long)v[G6MF_DA_BUILD_NOOPT],
+           (unsigned long long)v[G6MF_DA_BUILD_NO_LAST], (unsigned long long)v[G6MF_DA_BUILD_LAYOUT],
+           (unsigned long long)v[G6MF_DA_BUILD_STALE], (unsigned long long)v[G6MF_DA_BUILD_STORAGE],
+           (unsigned long long)v[G6MF_DA_BUILD_MASK], (unsigned long long)v[G6MF_DA_BUILD_CHANGED],
+           (unsigned long long)v[G6MF_DA_BUILD_OTHER], (unsigned long long)v[G6MF_DA_BATCH_HIT],
+           (unsigned long long)v[G6MF_DA_BATCH_MISS]);
+}
+
 static int nvmtl_metadata_reuse_on(void) {
     static int enabled = -1;
     int value = __atomic_load_n(&enabled, __ATOMIC_RELAXED);
@@ -3069,6 +3124,7 @@ static VkDescriptorSet nvmtl_snapshot_set_md(nvk_cmdbuf *c, uint32_t which, uint
         c->ndcache = 0; c->dcachepool = NULL;
     }
     if (c->ndcache) {
+        g6mf_desc_audit_event(G6MF_DA_BATCH_HIT);
         set = (VkDescriptorSet)c->dcache[--c->ndcache];
         pool = (VkDescriptorPool)c->dcachepool;
         r = VK_SUCCESS;
@@ -3079,6 +3135,7 @@ static VkDescriptorSet nvmtl_snapshot_set_md(nvk_cmdbuf *c, uint32_t which, uint
             else { c->dcache[c->ndcache++] = (void *)set; c->skipped++; return VK_NULL_HANDLE; }
         }
     } else {
+        g6mf_desc_audit_event(G6MF_DA_BATCH_MISS);
         pthread_mutex_lock(&g_desc_lock);
         if (ensure_descriptors_locked()) { pthread_mutex_unlock(&g_desc_lock); c->skipped++; return VK_NULL_HANDLE; }
         unsigned n = nvmtl_desc_batch();
@@ -3227,9 +3284,11 @@ static VkDescriptorSet nvmtl_snapshot_set_c(nvk_cmdbuf *c, uint32_t which, const
         }
         uniform = &uniformInfo;
     }
-    if (!t || !nvmtl_enc78_on(NVMTL_E78_H3))
+    if (!t || !nvmtl_enc78_on(NVMTL_E78_H3)) {
+        g6mf_desc_audit_event(G6MF_DA_BUILD_NOOPT);
         return nvmtl_snapshot_set_md(c, which, p->stex_hi[which], p->gmask_ok ? p->gmask[which] : NULL,
             p->tbany ? p->tbm[which] : NULL, VK_NULL_HANDLE, NULL, uniform);
+    }
     const uint64_t all[4] = { ~0ull, ~0ull, ~0ull, ~0ull };
     const uint64_t *pm = p->bmask_ok ? p->bmask : (p->gmask_ok && which < 2) ? p->gmask[which] : all;
     uint32_t hi = p->stex_hi[which];
@@ -3249,7 +3308,9 @@ static VkDescriptorSet nvmtl_snapshot_set_c(nvk_cmdbuf *c, uint32_t which, const
         for (int k = 0; k < 4; k++) if (pm[k] & ~t->lastw[which][k]) covered = 0;
         if (covered) {
             c->dyn_out[which] = t->lastdyn[which]; c->tab_out[which] = t->lasttab[which];
-            nvmtl_enc78_count(E78C_SETREUSE, 1); return t->last[which];
+            nvmtl_enc78_count(E78C_SETREUSE, 1);
+            g6mf_desc_audit_event(G6MF_DA_REUSE_EXACT);
+            return t->last[which];
         }
     }
     // Only buffer slots changed (Apple's GL rebinds its uniform bytes for every draw). A pipeline that reaches every
@@ -3275,6 +3336,7 @@ static VkDescriptorSet nvmtl_snapshot_set_c(nvk_cmdbuf *c, uint32_t which, const
             t->dirty[which] = 0; memset(t->chg[which], 0, sizeof t->chg[which]);
             c->dyn_out[which] = t->lastdyn[which]; c->tab_out[which] = t->lasttab[which];
             nvmtl_enc78_count(E78C_SETREUSE, 1);
+            g6mf_desc_audit_event(G6MF_DA_REUSE_TABLE);
             if (metadataOnly && !buffersReusable) __atomic_fetch_add(&g6mf_metadata_hits, 1, __ATOMIC_RELAXED);
             return t->last[which];
         }
@@ -3282,6 +3344,17 @@ static VkDescriptorSet nvmtl_snapshot_set_c(nvk_cmdbuf *c, uint32_t which, const
     uint64_t m[4];
     for (int k = 0; k < 4; k++) m[k] = pm[k] | (live ? t->lastw[which][k] : 0);
     if (live && t->last_hi[which] > hi) hi = t->last_hi[which];
+    if (g6mf_desc_audit_enabled()) {
+        int grew = 0, changed_used = 0;
+        for (int k = 0; k < 4; k++) {
+            grew |= !!(pm[k] & ~t->lastw[which][k]);
+            changed_used |= !!(t->chg[which][k] & pm[k]);
+        }
+        const int last_valid = t->last[which] && t->last_idx[which] < c->nsets
+            && (VkDescriptorSet)c->sets[t->last_idx[which]].set == t->last[which];
+        g6mf_desc_audit_event(g6mf_desc_audit_miss_reason(
+            !!t->last[which], sametb, last_valid, hi > t->last_hi[which], grew, changed_used));
+    }
     VkDescriptorSet from = VK_NULL_HANDLE; uint64_t cm[4] = { 0, 0, 0, 0 };
     if (live && nvmtl_dirty_only_on()) {
         from = t->last[which];
