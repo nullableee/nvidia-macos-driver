@@ -3099,6 +3099,15 @@ static void g6mf_desc_audit_event(enum g6mf_desc_audit_reason reason)
            (unsigned long long)v[G6MF_DA_BATCH_MISS]);
 }
 
+/* Snapshot counters for the isolated GPU probe. Read-only; no per-draw logging. */
+void g6mf_descriptor_audit_stats(uint64_t *out, unsigned count)
+{
+    if (!out || count < (unsigned)(G6MF_DA_N + 1)) return;
+    out[0] = atomic_load_explicit(&g6mf_da_events, memory_order_relaxed);
+    for (unsigned i = 0; i < G6MF_DA_N; i++)
+        out[1 + i] = atomic_load_explicit(&g6mf_da[i], memory_order_relaxed);
+}
+
 static int nvmtl_metadata_reuse_on(void) {
     static int enabled = -1;
     int value = __atomic_load_n(&enabled, __ATOMIC_RELAXED);

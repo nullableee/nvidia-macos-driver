@@ -51,4 +51,6 @@ assert 'g6mf_desc_audit_miss_reason(' in source
 assert 'g6mf_desc_audit_event(G6MF_DA_BATCH_HIT)' in source
 assert 'g6mf_desc_audit_event(G6MF_DA_BATCH_MISS)' in source
 assert 'nvmtl_snapshot_set_md(c, which, hi, m, p->tbany ? tb : NULL' in source
+assert 'void g6mf_descriptor_audit_stats(' in source
+assert 'DESC_AUDIT events=' in (ROOT/'tools/g6mf_descriptor_render_probe.m').read_text()
 print('PASS: production integration points present')
