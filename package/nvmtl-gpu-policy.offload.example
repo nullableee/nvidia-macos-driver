@@ -1,0 +1,22 @@
+# Example policy for render offload: Intel Iris Xe (WhateverXe) drives the display
+# and desktop, NVIDIA (e.g. RTX 4050) is a headless Metal device for heavy apps/games.
+#
+# Install as: /Library/GPUBundles/nvmtl-gpu-policy.txt
+# The plugin reads it when nmhybrid>0 or debug.nvaccel_headless>0 and another
+# Metal GPU is present. It must be a regular file owned by root and not writable
+# by group/others (like the DLSS cache policy).
+#
+# In headless+iGPU setups with no policy file, the driver defaults to "mode apple"
+# and keeps built-in macOS desktop/UI processes on the integrated GPU, so most
+# desktop work stays on Iris Xe and heavy apps can use NVIDIA.
+#
+# mode apple  # optional: follow NSSupportsAutomaticGraphicsSwitching
+#
+# Force specific apps onto NVIDIA (process name as seen in logs/Activity Monitor):
+# nvidia Blender
+# nvidia Cyberpunk2077
+# nvidia <YourGameProcessName>
+#
+# Force specific apps to stay on Iris Xe:
+# igpu Safari
+# igpu firefox

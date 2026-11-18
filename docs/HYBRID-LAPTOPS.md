@@ -199,13 +199,14 @@ the real file shows two different main programs.) The program is loaded first on
 
 ## Which GPU an application gets
 
-With the switch on and a second Metal GPU present (an integrated GPU macOS still drives, such as Coffee Lake), the plugin
-decides per process whether to offer the NVIDIA device. With no second Metal GPU the NVIDIA device is always offered,
+The plugin decides per process whether to offer the NVIDIA Metal device when a second Metal GPU is present and either the
+`nmhybrid` switch is on or the NVIDIA accelerator is headless (`debug.nvaccel_headless>0`, e.g. the integrated GPU drives
+the display natively while NVIDIA is a render-only device). With no second Metal GPU the NVIDIA device is always offered,
 because hiding it would leave the process without Metal.
 
 Optional file `/Library/GPUBundles/nvmtl-gpu-policy.txt`:
 
-    mode nvidia        # default: every process gets the NVIDIA device
+    mode nvidia        # default when the hybrid switch is on: every process gets the NVIDIA device
     mode apple         # Apple's rule: an app whose Info.plist sets NSSupportsAutomaticGraphicsSwitching to true is
                        # content with the low-power GPU and does not get the NVIDIA device; every other app keeps it
     igpu Safari        # this process never gets the NVIDIA device
@@ -213,8 +214,13 @@ Optional file `/Library/GPUBundles/nvmtl-gpu-policy.txt`:
 
 A per-process line beats the mode, the last matching line wins. Each decision is logged as `gpu policy for <process>: ...`
 in the plugin log. The plugin can offer a device or not; it cannot list a device without making it the default, so a
-process sent to the low-power GPU does not see the NVIDIA device in `MTLCopyAllDevices` either. That is why the default is
-`mode nvidia`. WindowServer is never offered the device when the NVIDIA GPU is headless (unchanged).
+process sent to the low-power GPU does not see the NVIDIA device in `MTLCopyAllDevices` either.
+
+In a headless dGPU + native iGPU setup (render offload, e.g. Iris Xe/WhateverXe owns the desktop and NVIDIA renders heavy
+apps), with no policy file the driver defaults to `mode apple` and keeps built-in macOS desktop/UI processes on the
+integrated GPU, so the desktop stays on the native compositor and only offload workloads use NVIDIA. See
+`package/nvmtl-gpu-policy.offload.example` for a starting point. WindowServer is never offered the device when the NVIDIA
+GPU is headless (unchanged).
 
 Apple's System Settings "automatic graphics switching" checkbox and the Activity Monitor GPU column come from Apple's
 graphics-control kexts, which a PC laptop does not have, so they do not appear; the policy file is the replacement. A
