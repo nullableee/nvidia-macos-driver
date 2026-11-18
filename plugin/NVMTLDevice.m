@@ -709,12 +709,15 @@ static bool nvmtl_other_metal_gpu(void)
     IOObjectRelease(it);
     return found;
 }
-// Per-process GPU choice on a hybrid laptop (nvmtl_gpu_policy.h). Inactive unless the hybrid switch is on.
+// Per-process GPU choice on a hybrid laptop (nvmtl_gpu_policy.h). Active when nmhybrid>0 or nvaccel_headless>0.
 static bool nvmtl_gpu_policy_allows(const char *me)
 {
-    int lv = 0; size_t ln = sizeof lv;
-    if (sysctlbyname("debug.nmhybrid", &lv, &ln, NULL, 0) != 0 || lv <= 0) return true;
+    int lv = 0, hv = 0; size_t ln = sizeof lv, hn = sizeof hv;
+    (void)sysctlbyname("debug.nmhybrid", &lv, &ln, NULL, 0);
+    (void)sysctlbyname("debug.nvaccel_headless", &hv, &hn, NULL, 0);
+    if (lv <= 0 && hv <= 0) return true;
     char text[4096] = {0};
+    int has_file = 0;
     // Read only a regular file owned by root and not writable by group or others, opened without following a link,
     // as the DLSS kernel cache is: the policy decides which processes get the GPU.
     int pfd = open("/Library/GPUBundles/nvmtl-gpu-policy.txt", O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
@@ -722,6 +725,7 @@ static bool nvmtl_gpu_policy_allows(const char *me)
         struct stat pst;
         if (fstat(pfd, &pst) == 0 && S_ISREG(pst.st_mode) && pst.st_uid == 0 && !(pst.st_mode & (S_IWGRP | S_IWOTH))) {
             ssize_t n = read(pfd, text, sizeof text - 1); text[n > 0 ? n : 0] = 0;
+            has_file = n > 0;
         } else nvlog("  gpu policy file ignored: not a root-owned regular file closed to other writers");
         close(pfd);
     }
@@ -733,7 +737,7 @@ static bool nvmtl_gpu_policy_allows(const char *me)
         if ([v respondsToSelector:@selector(boolValue)]) autosw = [v boolValue] ? 1 : 0;
     }
     const char *why = "";
-    int give = nmp_decide(lv, apple, pref, autosw, nvmtl_other_metal_gpu(), &why);
+    int give = nmp_decide_hybrid(lv, hv, has_file, apple, pref, autosw, nvmtl_other_metal_gpu(), me, &why);
     nvlog("  gpu policy for %s: %s (%s)", me, give ? "NVIDIA device" : "no NVIDIA device", why);
     return give != 0;
 }

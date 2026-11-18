@@ -33,6 +33,13 @@ int main(void)
     ARM("mode apple: an app that sets the key to false keeps it", DECIDE(1, 1, NMP_PREF_AUTO, 0, 1) == 1);
     const char *w = 0; nmp_decide(1, 1, NMP_PREF_AUTO, 1, 1, &w);
     ARM("the reason is named for the log", w && strstr(w, "automatic graphics switching"));
+#ifndef ALWAYS_NVIDIA
+    ARM("headless + iGPU: Finder stays on the integrated GPU", nmp_decide_hybrid(0, 1, 0, 0, NMP_PREF_AUTO, -1, 1, "Finder", &w) == 0);
+    ARM("headless + iGPU: Dock stays on the integrated GPU", nmp_decide_hybrid(0, 1, 0, 0, NMP_PREF_AUTO, -1, 1, "Dock", &w) == 0);
+    ARM("headless + iGPU: auto-switching app stays on the integrated GPU by default", nmp_decide_hybrid(0, 1, 0, 0, NMP_PREF_AUTO, 1, 1, "Safari", &w) == 0);
+    ARM("headless + iGPU: heavy game/app gets the NVIDIA GPU by default", nmp_decide_hybrid(0, 1, 0, 0, NMP_PREF_AUTO, -1, 1, "Cyberpunk2077", &w) == 1);
+    ARM("headless + iGPU: explicit nvidia rule overrides desktop process", nmp_decide_hybrid(0, 1, 1, 1, NMP_PREF_NVIDIA, 1, 1, "Terminal", &w) == 1);
+#endif
     printf("%d failed\n", fails);
     return fails != 0;
 }

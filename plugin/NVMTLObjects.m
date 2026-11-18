@@ -1725,6 +1725,45 @@ static void nvmtl_surface_remark_later(NVMTLTexture *r, uint32_t seed) {
     return YES;
     }
 }
+- (BOOL)nvmtlFuseSurfaceOutToCmd:(nvk_cmdbuf *)c {
+    NVMTLTexture *r = _parent ? _parent : self;
+    if (!r->_surf || r->_vramOn || !c || !c->cb || !nvmtl_surfout_import()) return NO;
+    @synchronized (nvmtl_surface_sync(r)) {
+        if (![r nvmtlSurfaceCopyable]) return NO;
+        void *base = IOSurfaceGetBaseAddressOfPlane(r->_surf, (uint32_t)r->_plane);
+        size_t row = IOSurfaceGetBytesPerRowOfPlane(r->_surf, (uint32_t)r->_plane);
+        if (!base || !row) return NO;
+        const size_t off = (size_t)((uint8_t *)base - (uint8_t *)IOSurfaceGetBaseAddress(r->_surf));
+        const size_t alloc = IOSurfaceGetAllocSize(r->_surf);
+        if (off >= alloc) return NO;
+        nvmtl_vk_host_pages_key((uint32_t)IOSurfaceGetID(r->_surf), nvmtl_host_pages_cookie(r->_surf));
+        int rc = nvmtl_vk_cmd_image_read_host(c, &r->_i, base, row, alloc - off, &r->_hostPages);
+        nvmtl_vk_host_pages_key(0, 0);
+        return rc == 0;
+    }
+}
+- (BOOL)nvmtlCompleteFusedSurfaceOut {
+    NVMTLTexture *r = _parent ? _parent : self;
+    if (!r->_surf) return YES;
+    @synchronized (nvmtl_surface_sync(r)) {
+        uint32_t lockopt = nvmtl_noseed() ? kIOSurfaceLockReadOnly : 0;
+        uint32_t lockSeed = 0, seed = 0;
+        if (IOSurfaceLock(r->_surf, lockopt, &lockSeed) != kIOReturnSuccess) return NO;
+        IOReturn unlocked = IOSurfaceUnlock(r->_surf, lockopt, &seed);
+        if (lockopt) seed = IOSurfaceGetSeed(r->_surf);
+        if (nvmtl_plane_seed_on() && !lockopt && unlocked == kIOReturnSuccess && IOSurfaceGetPlaneCount(r->_surf) > 1) {
+            const uint64_t cookie = nvmtl_plane_cookie(r->_surf, YES);
+            os_unfair_lock_lock(&g_ps_lock);
+            nvmtl_ps_record(&g_ps, (uint32_t)IOSurfaceGetID(r->_surf), cookie, (uint32_t)r->_plane, lockSeed, seed, clock_gettime_nsec_np(CLOCK_UPTIME_RAW));
+            os_unfair_lock_unlock(&g_ps_lock);
+        }
+        if (unlocked != kIOReturnSuccess) return NO;
+        r->_surfSeed = seed; r->_surfSynced = YES;
+        r->_surfGen = nvmtl_vram_gen(r->_surf, r->_plane);
+        static unsigned n; if (n++ < 6 || n % 2000 == 0) nvlog("G13 surface-out #%u: %ux%u surface %p seed %u (fused single-submit DMA)", n, r->_i.w, r->_i.h, (void *)r->_surf, seed);
+        return YES;
+    }
+}
 - (NSUInteger)width  { return MAX(1u, [self nvi]->w >> _baseLevel); }
 - (NSUInteger)height { return MAX(1u, [self nvi]->h >> _baseLevel); }
 - (NSUInteger)depth  { nvk_image *i = [self nvi]; return i->mtl_type == 7 ? MAX(1u, i->layers >> _baseLevel) : 1; }
@@ -4155,7 +4194,7 @@ static BOOL nvmtl_pixel_sampler_update(NSMutableDictionary *states, NSString *in
             [cb->_resources addObject:t];
             NVMTLTexture *sr = t->_parent ? t->_parent : t;
             if (sr->_surf) {
-                if (ca.loadAction == MTLLoadActionClear) nvmtl_surface_overwrite_recorded(cb, sr);
+                if (!nvmtl_load_keeps(ca.loadAction)) nvmtl_surface_overwrite_recorded(cb, sr);
                 else nvmtl_surface_in_for_cb(cb, sr);
                 nvmtl_surf_dirty(cb, sr); }
         }
@@ -7500,7 +7539,7 @@ destinationBytesPerImage:(NSUInteger)img options:(MTLBlitOption)opt {
             (unsigned long)d.colorAttachments[0].storeAction, d.colorAttachments[0].clearColor.red, d.colorAttachments[0].clearColor.green,
             d.colorAttachments[0].clearColor.blue, d.colorAttachments[0].clearColor.alpha, d.depthAttachment.texture != nil);
         if (sr->_surf) {
-            if (d.colorAttachments[0].loadAction == MTLLoadActionClear) nvmtl_surface_overwrite_recorded(self, sr);
+            if (!nvmtl_load_keeps(d.colorAttachments[0].loadAction)) nvmtl_surface_overwrite_recorded(self, sr);
             else nvmtl_surface_in_for_cb(self, sr);
             nvmtl_surf_dirty(self, sr); } }
     const float defaultBlend[4] = { 0, 0, 0, 0 };

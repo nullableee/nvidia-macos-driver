@@ -72,4 +72,40 @@ static inline int nmp_decide(int hybrid_level, int mode_apple, int pref, int app
     return r;
 }
 
+/* Built-in macOS desktop/UI processes that should stay on the native integrated GPU when the discrete GPU is headless. */
+static inline int nmp_is_desktop_process(const char *proc)
+{
+    static const char *const kDesktop[] = {
+        "WindowServer", "Finder", "Dock", "ControlCenter", "SystemUIServer", "Spotlight",
+        "WallpaperAgent", "NotificationCenter", "WindowManager", "loginwindow",
+        "System Settings", "Activity Monitor", "Terminal", "Preview", "TextEdit",
+        "QuickLookUIService", "CoreServicesUIAgent", "universalaccessd", "talagent",
+        "ScreenSaverEngine", "WiFiAgent", "TextInputMenuAgent", "AirPlayUIAgent", "OSDUIHelper",
+        NULL
+    };
+    if (!proc || !*proc) return 0;
+    for (int i = 0; kDesktop[i]; i++) if (!strcmp(proc, kDesktop[i])) return 1;
+    return 0;
+}
+
+/* Hybrid GPU decision covering both nmhybrid>0 and headless discrete GPU + native iGPU (WhateverXe) setups. */
+static inline int nmp_decide_hybrid(int hybrid_level, int headless, int has_policy_file, int mode_apple,
+                                    int pref, int app_auto_switch, int other_metal_gpu, const char *proc, const char **why)
+{
+    if (hybrid_level <= 0 && headless <= 0)
+        return nmp_decide(0, mode_apple, pref, app_auto_switch, other_metal_gpu, why);
+    if (!other_metal_gpu)
+        return nmp_decide(1, mode_apple, pref, app_auto_switch, 0, why);
+    if (pref == NMP_PREF_IGPU || pref == NMP_PREF_NVIDIA)
+        return nmp_decide(1, mode_apple, pref, app_auto_switch, 1, why);
+    if (headless > 0) {
+        if (nmp_is_desktop_process(proc)) {
+            if (why) *why = "hybrid desktop: macOS system/UI process stays on the integrated GPU";
+            return 0;
+        }
+        if (!has_policy_file) mode_apple = 1;
+    }
+    return nmp_decide(1, mode_apple, pref, app_auto_switch, 1, why);
+}
+
 #endif

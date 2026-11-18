@@ -24,6 +24,7 @@
     BOOL claimed;
     NSArray<NVMTLBuffer *> *copyInputs;
     BOOL copyInputsPrepared, hasHostCopies;
+    NSSet<NVMTLTexture *> *fusedSurfaces;
 }
 @end
 static _Atomic unsigned gsub_inflight;
@@ -640,6 +641,28 @@ static void nvmtl_prepare_submission_copies(NVMTLSubmissionPart *part) {
     }
     part->copyInputsPrepared = YES;
 }
+static int nvmtl_fuse_surfout_on(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("NVMTL_FUSE_SURFOUT"); on = !(e && e[0] == '0'); }
+    return on;
+}
+static void nvmtl_fuse_part_surfaces(NVMTLSubmissionPart *part) {
+    if (!part || !part->commands.cb || !part->surfaces.count || !nvmtl_fuse_surfout_on()) return;
+    NSMutableSet<NVMTLTexture *> *fused = nil;
+    NSMutableSet<NVMTLTexture *> *roots = nil;
+    for (NVMTLTexture *t in part->surfaces) {
+        NVMTLTexture *r = t->_parent ? t->_parent : t;
+        if (!r->_surf || r->_vramOn) continue;
+        if (roots && [roots containsObject:r]) { [fused addObject:t]; continue; }
+        if ([t nvmtlFuseSurfaceOutToCmd:&part->commands]) {
+            if (!roots) roots = [NSMutableSet new];
+            if (!fused) fused = [NSMutableSet new];
+            [roots addObject:r];
+            [fused addObject:t];
+        }
+    }
+    part->fusedSurfaces = fused;
+}
 - (BOOL)nvmtlSubmitAhead {
     // a commit still putting its kernel marks in (nvmtlSubmitWithEvents) must not reach the GPU before them
     if (_executionDone || _partsRetiring || _cbError || !_committed || _commitMarking) return NO;
@@ -674,6 +697,7 @@ static void nvmtl_prepare_submission_copies(NVMTLSubmissionPart *part) {
         nvmtl_inflight *f = nvmtl_vk_inflight_new();
         if (!f) return NO;
         for (NVMTLBuffer *buffer in part->copyInputs) nvmtl_buffer_sync_in(buffer);
+        nvmtl_fuse_part_surfaces(part);
         [self nvmtlMarkScheduled];
         if (!_legacyKernelStart) _legacyKernelStart = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1e9;
         const int r = nvmtl_vk_submit_begin(&part->commands, f);
@@ -746,6 +770,7 @@ static void nvmtl_gsub_ahead_pass1(void) {
         else {
             nvmtl_prepare_submission_copies(part);
             for (NVMTLBuffer *buffer in part->copyInputs) nvmtl_buffer_sync_in(buffer);
+            nvmtl_fuse_part_surfaces(part);
             // A worker-owned part is an ordering barrier until QueueSubmit has
             // accepted it. Publish that progress before waiting on its fence so
             // the ahead lane can issue later parts in the same queue.
@@ -776,7 +801,10 @@ static void nvmtl_gsub_ahead_pass1(void) {
             // the GPU has finished this part: its surfaces' kernel marks are released (nvmtl_ws_part_landed) before the
             // surface work below, which takes the surface's own lock
             NSMutableArray *settled = [NSMutableArray new];
-            for (NVMTLTexture *texture in nvmtl_ws_part_landed(self, _nextPart, settled)) if (![texture nvmtlSurfaceOut]) published = NO;
+            for (NVMTLTexture *texture in nvmtl_ws_part_landed(self, _nextPart, settled)) {
+                BOOL ok = [part->fusedSurfaces containsObject:texture] ? [texture nvmtlCompleteFusedSurfaceOut] : [texture nvmtlSurfaceOut];
+                if (!ok) published = NO;
+            }
             if (!nvmtl_ws_publish_settled(settled, self)) published = NO;
             for (NVMTLBuffer *buffer in nvmtl_submission_copies(part->resources, YES)) nvmtl_buffer_sync_out(buffer);
         }

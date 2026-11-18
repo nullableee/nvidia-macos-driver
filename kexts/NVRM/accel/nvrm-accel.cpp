@@ -511,7 +511,7 @@ public:
                 *other = false;
                 strlcat(owner, " without a Metal accelerator", len);
             }
-            break;
+            if (*other) break;
         }
         it->release();
     }
@@ -546,7 +546,9 @@ public:
             char owner[64] = "none found";
             bool other = false;
             headlessDisplayOwner(owner, sizeof owner, &other);
-            const bool early = other && headlessNoDisplayHere();
+            int nvfb = 1;
+            PE_parse_boot_argn("nvfb", &nvfb, sizeof nvfb);
+            const bool early = other && (headlessNoDisplayHere() || !nvfb);
             if (!early && me->fHeadlessWaited < me->fHeadlessDeadlineSec) {
                 uint64_t when = 0;
                 clock_interval_to_deadline(kHeadlessPollSec, kSecondScale, &when);
