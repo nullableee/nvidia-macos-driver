@@ -36,9 +36,13 @@ int main(void)
 #ifndef ALWAYS_NVIDIA
     ARM("headless + iGPU: Finder stays on the integrated GPU", nmp_decide_hybrid(0, 1, 0, 0, NMP_PREF_AUTO, -1, 1, "Finder", &w) == 0);
     ARM("headless + iGPU: Dock stays on the integrated GPU", nmp_decide_hybrid(0, 1, 0, 0, NMP_PREF_AUTO, -1, 1, "Dock", &w) == 0);
+    ARM("headless + iGPU: WindowServer is classified as a desktop process", nmp_is_desktop_process("WindowServer"));
+    ARM("headless + iGPU: ControlCenter stays on the integrated GPU", nmp_decide_hybrid(0, 1, 0, 0, NMP_PREF_AUTO, -1, 1, "ControlCenter", &w) == 0);
     ARM("headless + iGPU: auto-switching app stays on the integrated GPU by default", nmp_decide_hybrid(0, 1, 0, 0, NMP_PREF_AUTO, 1, 1, "Safari", &w) == 0);
     ARM("headless + iGPU: heavy game/app gets the NVIDIA GPU by default", nmp_decide_hybrid(0, 1, 0, 0, NMP_PREF_AUTO, -1, 1, "Cyberpunk2077", &w) == 1);
     ARM("headless + iGPU: explicit nvidia rule overrides desktop process", nmp_decide_hybrid(0, 1, 1, 1, NMP_PREF_NVIDIA, 1, 1, "Terminal", &w) == 1);
+    ARM("headless + iGPU: explicit igpu rule keeps a heavy app on Intel", nmp_decide_hybrid(0, 1, 1, 0, NMP_PREF_IGPU, -1, 1, "RenderApp", &w) == 0);
+    ARM("headless + iGPU: desktop-process decision is named in the log", (nmp_decide_hybrid(0, 1, 0, 0, NMP_PREF_AUTO, -1, 1, "WindowServer", &w) == 0 && w && strstr(w, "desktop")));
 #endif
     printf("%d failed\n", fails);
     return fails != 0;
