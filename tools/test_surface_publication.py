@@ -27,6 +27,7 @@ fixture = r'''
 typedef struct __IOSurface { unsigned seed; unsigned char cpu[4]; } Surface;
 typedef int IOReturn;
 enum { kIOSurfaceLockReadOnly = 1 };
+typedef struct { void *cb; } nvk_cmdbuf;
 typedef struct { unsigned w,h,bpp; unsigned char gpu[4]; } Image;
 static dispatch_semaphore_t entered, release_read;
 static unsigned uploads, gpu_seed;
@@ -50,6 +51,9 @@ static size_t IOSurfaceGetAllocSize(IOSurfaceRef s) { return sizeof s->cpu; }
 // the host-page fast paths (#399) report "not available", so the copies below take the plain path this test checks
 static int nvmtl_vk_image_write_host(void *q, Image *img, void *base, size_t row, size_t bytes, void *cache) { return -1; }
 static int nvmtl_vk_image_read_host(void *q, Image *img, void *base, size_t row, size_t bytes, void *cache) { return -1; }
+static int nvmtl_vk_cmd_image_read_host(nvk_cmdbuf *c, Image *img, void *base, size_t row, size_t bytes, void *cache) {
+    (void)c; (void)img; (void)base; (void)row; (void)bytes; (void)cache; return -1;
+}
 static uint32_t nvmtl_vram_gen(IOSurfaceRef s, NSUInteger p) { return 1; }
 static int nvmtl_vram_tag_current(IOSurfaceRef s, NSUInteger p, unsigned seed) { return gpu_seed == seed; }
 static void nvmtl_vram_tag_set(IOSurfaceRef s, NSUInteger p, unsigned seed) { gpu_seed=seed; }
