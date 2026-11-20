@@ -94,8 +94,11 @@ arm("NMIntelFB: stop() uses the same unwind, so the two cannot drift apart", "st
 # Negative control: the first fix's order (map check after the DMC target and tcStart) must be caught.
 first_fix = subprocess.run(["git", "-C", str(ROOT), "show", "13a9a0bc:kexts/NMIntelFB/intelfb.cpp"],
                            capture_output=True, text=True)
-arm("negative control: the map-after-publish order of the first fix is caught",
-    first_fix.returncode == 0 and not map_before_publish(start_bodies(first_fix.stdout, "NMIntelFB")[-1]))
+if first_fix.returncode == 0:
+    arm("negative control: the map-after-publish order of the first fix is caught",
+        not map_before_publish(start_bodies(first_fix.stdout, "NMIntelFB")[-1]))
+else:
+    print("SKIP: historical calibration commit 13a9a0bc is not in this checkout")
 nvfb = (ROOT / "kexts/NVRMFB/fb/nvrm-fb.cpp").read_text(encoding="utf-8")
 arm("NVRMFB still sets its dependent ID before super::start (the reference order)",
     nvfb.index('setProperty("IOFBDependentID"') < nvfb.index("if (!super::start(provider)) {"))
