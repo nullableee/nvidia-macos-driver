@@ -5,12 +5,14 @@ Logic Pro 12.3.1 on 2.6.5 (plugin 78BE873A) crashed opening the Dolby Atmos mixe
 a texture through copyFromBuffer:toTexture:, the layout barrier carried a null VkImage, and NVK read 0x520 from it in
 nvk_CmdPipelineBarrier2. The production copy functions are compiled with Vulkan dispatch stubbed; an optional argument
 checks another nvmtl_vk.c (the 2.6.5 one dispatches the null image and fails the first arms)."""
+import os
 import pathlib
 import subprocess
 import sys
 import tempfile
 
 root = pathlib.Path(__file__).resolve().parents[1]
+vulkan_headers = pathlib.Path(os.environ.get('VULKAN_HEADERS', str(pathlib.Path.home() / 'Vulkan-Headers'))) / 'include'
 source_path = pathlib.Path(sys.argv[1]) if len(sys.argv) > 1 else root / 'plugin/nvmtl_vk.c'
 source = source_path.read_text()
 
@@ -87,7 +89,7 @@ with tempfile.TemporaryDirectory(prefix='nvmtl-copy-null-image-') as temporary:
     path = pathlib.Path(temporary)
     (path / 'test.c').write_text(fixture)
     r = subprocess.run(['xcrun', 'clang', '-O1', '-g', '-fsanitize=address,undefined', str(path / 'test.c'),
-                        '-I' + str(root / 'plugin'), '-I' + str(pathlib.Path.home() / 'Vulkan-Headers/include'),
+                        '-I' + str(root / 'plugin'), '-I' + str(vulkan_headers),
                         '-o', str(path / 'test')], capture_output=True, text=True, timeout=300)
     if r.returncode:
         print(r.stderr[-2000:])
