@@ -42,7 +42,9 @@ check('our own heads never count as the other GPU', 'metaCast("NVRMNVDAFramebuff
 check('the Intel panel driver (a head of this accelerator) never triggers the early hand-over',
       'metaCast("NMIntelFB")) break' in own and own.index('NMIntelFB') < own.index('vendor-id'))
 hc = body('static void headlessCheck(void *p0, void *)')
-check('early hand-over needs both conditions', 'const bool early = other && headlessNoDisplayHere();' in hc)
+check('early hand-over needs another GPU and either no NVIDIA display or nvfb disabled',
+      'const bool early = other && (headlessNoDisplayHere() || !nvfb);' in hc
+      and 'PE_parse_boot_argn("nvfb", &nvfb, sizeof nvfb);' in hc)
 check('without them it polls again until the deadline', 'if (!early && me->fHeadlessWaited < me->fHeadlessDeadlineSec)' in hc
       and 'thread_call_enter_delayed(me->fHeadlessCall' in hc)
 check('the re-poll path releases the registration lock', hc.count('IOLockUnlock(me->fRegLock)') >= 2)
