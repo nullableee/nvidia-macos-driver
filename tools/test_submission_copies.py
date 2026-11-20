@@ -140,6 +140,10 @@ typedef struct { int unused; } nvmtl_inflight;
 @implementation NVMTLTexture (Publication)
 - (BOOL)nvmtlSurfaceOut { return [self nvmtlSurfaceOutDirtied:NO]; }
 - (BOOL)nvmtlSurfaceOutDirtied:(BOOL)dirtied { if (events) [events addObject:[NSString stringWithFormat:@"o%d:%d",_tag,(int)dirtied]]; return YES; }
+// Fused IOSurface DMA has its own surface-publication fixture. Keep it disabled here so this test isolates
+// submission-copy discovery, event ordering and host-buffer synchronization.
+- (BOOL)nvmtlFuseSurfaceOutToCmd:(nvk_cmdbuf *)c { (void)c; return NO; }
+- (BOOL)nvmtlCompleteFusedSurfaceOut { return YES; }
 @end
 @interface NVMTLCommandBuffer : NSObject { @public
     BOOL _executionDone, _committed, _commitMarking, _partsRetiring; NSError *_cbError;
