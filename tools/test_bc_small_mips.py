@@ -4,12 +4,14 @@
 An optional source path permits checking an older revision with the same cases.
 This does not load a driver or perform a GPU copy.
 """
+import os
 import pathlib
 import subprocess
 import sys
 import tempfile
 
 root = pathlib.Path(__file__).resolve().parents[1]
+vulkan_headers = pathlib.Path(os.environ.get('VULKAN_HEADERS', str(pathlib.Path.home() / 'Vulkan-Headers'))) / 'include'
 source_path = pathlib.Path(sys.argv[1]) if len(sys.argv) > 1 else root/'plugin/nvmtl_vk.c'
 source = source_path.read_text()
 
@@ -125,6 +127,6 @@ with tempfile.TemporaryDirectory(prefix='nvmtl-bc-small-mips-') as temporary:
     path = pathlib.Path(temporary)
     (path/'test.c').write_text(fixture)
     subprocess.run(['xcrun','clang','-O1','-g','-fsanitize=address,undefined',str(path/'test.c'),
-                    '-I'+str(root/'plugin'),'-I'+str(pathlib.Path.home()/'Vulkan-Headers/include'),
+                    '-I'+str(root/'plugin'),'-I'+str(vulkan_headers),
                     '-o',str(path/'test')],check=True)
     subprocess.run([str(path/'test')],check=True)
