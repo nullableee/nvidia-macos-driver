@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """Exercise production graphics binding elision, including every cache input."""
+import os
 import pathlib
 import subprocess
 import tempfile
 
 root = pathlib.Path(__file__).resolve().parents[1]
+vulkan_headers = pathlib.Path(os.environ.get('VULKAN_HEADERS', str(pathlib.Path.home() / 'Vulkan-Headers'))) / 'include'
 source = (root/'plugin/nvmtl_vk.c').read_text()
 def section(start, end):
     i = source.index(start)
@@ -103,5 +105,5 @@ with tempfile.TemporaryDirectory(prefix='nvmtl-graphics-bindings-') as tmp:
     path=pathlib.Path(tmp)
     (path/'test.c').write_text(fixture)
     subprocess.run(['xcrun','clang','-O2',str(path/'test.c'),'-I'+str(root/'plugin'),
-                    '-I'+str(pathlib.Path.home()/'Vulkan-Headers/include'),'-o',str(path/'test')],check=True)
+                    '-I'+str(vulkan_headers),'-o',str(path/'test')],check=True)
     subprocess.run([str(path/'test')],check=True)
