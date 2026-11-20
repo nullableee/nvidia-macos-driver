@@ -23,6 +23,22 @@ check('a very large surface is imported per copy as before', '64u << 20' in leas
 check('the copy uses a lease before the private cache', func(vk, 'static nvk_buffer *nvmtl_host_pages(').index('nvmtl_hp_lease') < func(vk, 'static nvk_buffer *nvmtl_host_pages(').index('cache->buf'))
 done = func(vk, 'static void nvmtl_host_pages_done(')
 check('a leased buffer is given back, never destroyed under its other users', 'nvmtl_ic_release(' in done and done.index('nvmtl_ic_release') < done.index('nvmtl_vk_buffer_destroy(hb)'))
-check('both host copies name their surface and clear the key afterwards', ob.count('nvmtl_vk_host_pages_key(0, 0);') == 2 and ob.count('nvmtl_vk_host_pages_key((uint32_t)IOSurfaceGetID') == 2)
+def has_surface_key(body, operation):
+    pos = body.find(operation)
+    if pos < 0:
+        return False
+    key = body.rfind('nvmtl_vk_host_pages_key((uint32_t)IOSurfaceGetID', 0, pos)
+    clear = body.find('nvmtl_vk_host_pages_key(0, 0);', pos)
+    return key >= 0 and clear > pos
+
+surface_in = func(ob, '- (void)nvmtlSurfaceIn {')
+surface_out = func(ob, '- (BOOL)nvmtlSurfaceOutDirtied:(BOOL)dirtied {')
+surface_fused = func(ob, '- (BOOL)nvmtlFuseSurfaceOutToCmd:(nvk_cmdbuf *)c {')
+check('surface-in upload names its surface and clears the key after the host copy',
+      has_surface_key(surface_in, 'nvmtl_vk_image_write_host('))
+check('surface-out readback names its surface and clears the key after the host copy',
+      has_surface_key(surface_out, 'nvmtl_vk_image_read_host('))
+check('fused surface readback names its surface and clears the key after the host copy',
+      has_surface_key(surface_fused, 'nvmtl_vk_cmd_image_read_host('))
 check('the default path never reads or writes the surface cookie', 'return on ? nvmtl_plane_cookie(s, YES) : 0;' in ob)
 sys.exit(1 if fails else 0)
