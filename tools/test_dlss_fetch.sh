@@ -17,8 +17,16 @@ t() { if "$@"; then echo 0; else echo 1; fi; }
 F=$W/files; mkdir -p "$F" "$W/tools"
 printf 'dlss runtime\n' > "$F/dlss.so"; printf 'dlssd runtime\n' > "$F/dlssd.so"; printf 'dlssg runtime\n' > "$F/dlssg.so"
 # stand-in for NVIDIA's makeself .run: a shell header with skip=N, then a zstd-compressed tar (as the real one is)
-ZSTD=${ZSTD:-$(command -v zstd || echo /opt/homebrew/bin/zstd)}   # only the fixture needs the compressor; the script under test never does
-[ -x "$ZSTD" ] || { echo "test needs a zstd command (set ZSTD=) to build its fixture"; exit 2; }
+if [[ -z "${ZSTD:-}" ]]; then
+  for candidate in /usr/local/bin/zstd /opt/homebrew/bin/zstd /usr/bin/zstd; do
+    if [[ -x "$candidate" ]]; then ZSTD="$candidate"; break; fi
+  done
+fi
+# Only this fixture needs the compressor; the script under test never does. A missing optional tool is a skip, not a driver failure.
+[ -n "${ZSTD:-}" ] && [ -x "$ZSTD" ] || {
+  echo "SKIP: zstd is required for this fixture (install with 'brew install zstd' or set ZSTD=/absolute/path/to/zstd)"
+  exit 2
+}
 mkdir -p "$W/payload" && printf 'ngx core\n' > "$W/payload/libnvidia-ngx.so.620.70.06" && printf 'other\n' > "$W/payload/other.bin"
 { printf '#!/bin/sh\n# makeself stand-in\nCRCsum=0\nskip=6\n'; printf 'exit 1\n'; tar -C "$W/payload" -cf - . | "$ZSTD" -q -c; } > "$F/driver.run"
 clang -O1 -DZSTD_DISABLE_ASM -o "$W/tools/nm_unzstd" "$ROOT/dlss/nm_unzstd.c" "$ROOT"/dlss/zstd/common/*.c "$ROOT"/dlss/zstd/decompress/*.c || { echo "cannot build nm_unzstd"; exit 2; }
