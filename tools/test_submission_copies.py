@@ -118,10 +118,11 @@ submission_fixture = r"""
 #import <IOSurface/IOSurface.h>
 #include <stdatomic.h>
 #include <time.h>
-typedef struct { void *cb; } Commands;
+typedef struct { void *cb; } nvk_cmdbuf;
+typedef nvk_cmdbuf Commands;
 typedef struct { int unused; } nvmtl_inflight;
 @interface NVMTLSubmissionPart : NSObject { @public
-    Commands commands; NSSet *resources; NSArray *surfaces, *scratch, *signals;
+    Commands commands; NSSet *resources, *fusedSurfaces; NSArray *surfaces, *scratch, *signals;
     id waitEvent, signalEvent; uint64_t value;
     BOOL waitFolded, aheadEmpty, claimed; int aheadFailed; unsigned encoders;
     nvmtl_inflight *inflight;
@@ -131,6 +132,8 @@ typedef struct { int unused; } nvmtl_inflight;
 @interface NVMTLTexture (Publication)
 - (BOOL)nvmtlSurfaceOut;
 - (BOOL)nvmtlSurfaceOutDirtied:(BOOL)dirtied;
+- (BOOL)nvmtlFuseSurfaceOutToCmd:(nvk_cmdbuf *)c;
+- (BOOL)nvmtlCompleteFusedSurfaceOut;
 @end
 // every publication is logged in events as "o<tag>:<dirtied>" (dirtied: the commit's VRAM mark stands, nothing is asked
 // of the kernel again)
