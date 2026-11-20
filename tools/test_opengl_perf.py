@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """Exercise production OpenGL descriptor reuse, encoder defaults and resource-cache lifetime without a GPU."""
+import os
 import pathlib
 import re
 import subprocess
 import tempfile
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
+VULKAN_HEADERS = pathlib.Path(os.environ.get('VULKAN_HEADERS', str(pathlib.Path.home() / 'Vulkan-Headers'))) / 'include'
 vk = (ROOT / 'plugin/nvmtl_vk.c').read_text()
 objects = (ROOT / 'plugin/NVMTLObjects.m').read_text()
 header = (ROOT / 'plugin/NVMTLObjects.h').read_text()
@@ -250,7 +252,7 @@ int main(void) {
 
 with tempfile.TemporaryDirectory() as d:
     path = pathlib.Path(d)
-    includes = ['-I' + str(ROOT / 'plugin'), '-I' + str(pathlib.Path.home() / 'Vulkan-Headers/include')]
+    includes = ['-I' + str(ROOT / 'plugin'), '-I' + str(VULKAN_HEADERS)]
     for name, code, objc in [('descriptors', fixture + mask + cache + checks, False), ('resources', resources, True),
                              ('defaults', state, False), ('bias', bias_check, False)]:
         src = path / (name + ('.m' if objc else '.c'))
